@@ -12,6 +12,7 @@ struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
+struct phase_fields;
 
 //
 // llama_kv_cache
@@ -156,6 +157,7 @@ public:
     //
 
     uint32_t get_size()     const;
+    void fill_phase_snapshot(phase_fields & fields) const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -167,6 +169,7 @@ public:
     ggml_tensor * get_k_storage(int32_t il) const;
 
     const llama_kv_cells & get_cells(llama_seq_id seq_id) const;
+    uint32_t get_stream_for_seq(llama_seq_id seq_id) const;
 
     // state_read, plus the cells the restored tokens were placed in
     // a cache that mirrors another one (the qwen4exp indexer) must not search for its own cells: two searches agree only by luck

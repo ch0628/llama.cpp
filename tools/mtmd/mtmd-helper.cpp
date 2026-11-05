@@ -9,6 +9,7 @@
 
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "phase-events.h"
 #include "mtmd-helper-common.h"
 #include "llama.h"
 
@@ -174,7 +175,58 @@ int32_t mtmd_helper_decode_image_chunk(
         LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
 
         int64_t t1 = ggml_time_ms();
-        int32_t ret = llama_decode(lctx, batch_embd_view);
+        phase_fields prefill_fields;
+        const auto & request = phase_active_request();
+        prefill_fields.request_id = request.request_id;
+        prefill_fields.task_id = request.task_id;
+        prefill_fields.slot_id = request.slot_id;
+        prefill_fields.item_idx = request.item_idx;
+        prefill_fields.sub_idx = i_batch;
+        prefill_fields.token_count = n_tokens_batch;
+        prefill_fields.q_len = batch_embd_view.n_tokens;
+        prefill_fields.seq_id = seq_id;
+        prefill_fields.pos_start = batch_embd_view.pos[0];
+        prefill_fields.pos_end = batch_embd_view.pos[batch_embd_view.n_tokens - 1];
+        prefill_fields.input_kind = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "VISUAL" : "UNKNOWN";
+        const auto generic_span = phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields);
+        const auto prefill_span = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? phase_event("mtmd", "VISUAL_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields) : 0;
+        if (generic_span || prefill_span) {
+            prefill_fields.call_id = generic_span;
+            phase_set_call(prefill_span ? prefill_span : generic_span);
+            phase_set_link(prefill_fields, "PREFILL");
+        }
+        phase_kv_snapshot(lctx, "KV_PREFILL_CALL_BEFORE", prefill_fields);
+        const uint64_t call_start_ns = phase_now_ns();
+        int32_t ret;
+        try {
+            ret = llama_decode(lctx, batch_embd_view);
+        } catch (...) {
+            prefill_fields.note = "exception";
+            prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
+            phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+            phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", prefill_fields);
+            phase_set_call(0);
+            phase_flush();
+            throw;
+        }
+        prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
+        prefill_fields.status = ret;
+        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            auto legacy_fields = prefill_fields;
+            legacy_fields.call_id = prefill_span;
+            phase_event("mtmd", "VISUAL_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, prefill_span, legacy_fields);
+        }
+        phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+        phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", prefill_fields);
+        phase_set_call(0);
+        if (ret != 0) {
+            phase_flush();
+        }
+        if (ret == 0 && chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE && phase_sync_validate()) {
+            const auto sync_span = phase_event("mtmd", "LLM_SYNC_START", phase_kind::START, 0, prefill_fields);
+            llama_synchronize(lctx);
+            phase_event("mtmd", "LLM_SYNC_END", phase_kind::END, sync_span, prefill_fields);
+        }
         if (ret != 0) {
             LOG_ERR("failed to decode %s\n", name);
             return ret;
@@ -217,6 +269,7 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
         const auto tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
         // LOG_INF("decoding text chunk, n_tokens = %zu\n", n_tokens);
         size_t i = 0;
+        int64_t sub_idx = 0;
         while (i < n_tokens) { // split into batches
             text_batch.n_tokens = 0; // clear the batch
             for (; i < n_tokens && text_batch.n_tokens < n_batch; i++) {
@@ -233,7 +286,44 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
             if (logits_last && is_last_token) {
                 text_batch.logits[text_batch.n_tokens - 1] = true;
             }
-            ret = llama_decode(lctx, text_batch);
+            phase_fields fields;
+            const auto & request = phase_active_request();
+            fields.request_id = request.request_id;
+            fields.task_id = request.task_id;
+            fields.slot_id = request.slot_id;
+            fields.item_idx = request.item_idx;
+            fields.sub_idx = sub_idx++;
+            fields.token_count = text_batch.n_tokens;
+            fields.q_len = text_batch.n_tokens;
+            fields.seq_id = seq_id;
+            fields.pos_start = text_batch.pos[0];
+            fields.pos_end = text_batch.pos[text_batch.n_tokens - 1];
+            fields.input_kind = "TEXT";
+            const auto span = phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, fields);
+            fields.call_id = span ? span : -1;
+            phase_set_call(span);
+            phase_set_link(fields, "PREFILL");
+            phase_kv_snapshot(lctx, "KV_PREFILL_CALL_BEFORE", fields);
+            const uint64_t call_start_ns = phase_now_ns();
+            try {
+                ret = llama_decode(lctx, text_batch);
+            } catch (...) {
+                fields.note = "exception";
+                fields.duration_ns = phase_now_ns() - call_start_ns;
+                phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+                phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", fields);
+                phase_set_call(0);
+                phase_flush();
+                throw;
+            }
+            fields.duration_ns = phase_now_ns() - call_start_ns;
+            fields.status = ret;
+            phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+            phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", fields);
+            phase_set_call(0);
+            if (ret != 0) {
+                phase_flush();
+            }
             if (ret != 0) {
                 LOG_ERR("failed to decode text\n");
                 llama_batch_free(text_batch);
@@ -405,13 +495,21 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
     // otherwise, we assume it's an image
     if (!result) {
         int nx, ny, nc;
+        const auto image_decode_span = phase_event("mtmd", "IMAGE_DECODE_START", phase_kind::START);
         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
         if (data) {
             result = mtmd_bitmap_init(nx, ny, placeholder ? nullptr : data);
             mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
             stbi_image_free(data);
+            phase_fields fields;
+            fields.image_w = nx;
+            fields.image_h = ny;
+            phase_event("mtmd", "IMAGE_DECODE_END", phase_kind::END, image_decode_span, fields);
             return {result, nullptr};
         }
+        phase_fields fields;
+        fields.status = -2;
+        phase_event("mtmd", "IMAGE_DECODE_END", phase_kind::END, image_decode_span, fields);
         // otherwise, fallthrough to video decoding (if supported)
     }
 

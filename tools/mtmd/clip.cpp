@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "clip-model.h"
 #include "clip-graph.h"
+#include "phase-events.h"
 #include "models/models.h"
 
 #include "ggml.h"
@@ -4425,7 +4426,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
+        const auto warmup_span = phase_event("vision", "VISION_INTERNAL_WARMUP_START", phase_kind::START);
         clip_model_loader::warmup(*ctx, *params->imgs);
+        phase_event("vision", "VISION_INTERNAL_WARMUP_END", phase_kind::END, warmup_span);
     }
 
     if (params->seed != ctx->rng_seed) {
@@ -4434,9 +4437,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
     }
 
     // build the inference graph
+    const auto graph_span = phase_event("vision", "VISION_GRAPH_PREP_START", phase_kind::START);
     ggml_backend_sched_reset(ctx->sched.get());
     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
+    phase_event("vision", "VISION_GRAPH_PREP_END", phase_kind::END, graph_span);
+    const auto input_span = phase_event("vision", "VISION_INPUT_SETUP_START", phase_kind::START);
 
     // set inputs
     const auto & model   = ctx->model;
@@ -5746,7 +5752,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
         }
     }
 
+    phase_event("vision", "VISION_INPUT_SETUP_END", phase_kind::END, input_span);
+    const auto compute_span = phase_event("vision", "VISION_COMPUTE_START", phase_kind::START);
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    phase_fields compute_fields;
+    compute_fields.status = status;
+    phase_event("vision", "VISION_COMPUTE_END", phase_kind::END, compute_span, compute_fields);
     if (status != GGML_STATUS_SUCCESS) {
         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
         return false;
@@ -5775,7 +5786,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
                 LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
                 GGML_ABORT("Output buffer size mismatch");
             }
+            const auto copy_span = phase_event("vision", "VISION_EMBED_COPY_START", phase_kind::START);
             ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
+            phase_event("vision", "VISION_EMBED_COPY_END", phase_kind::END, copy_span);
+            phase_fields ready_fields;
+            ready_fields.token_count = n_tokens_out;
+            phase_event("vision", "VISUAL_EMBEDDING_READY", phase_kind::POINT, 0, ready_fields);
         } else {
             LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
         }

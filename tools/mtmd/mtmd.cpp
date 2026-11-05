@@ -2,6 +2,7 @@
 #include "clip-impl.h"
 #include "mtmd.h"
 #include "mtmd-internal.h"
+#include "phase-events.h"
 #include "mtmd-audio.h"
 #include "mtmd-image.h"
 #include "debug/mtmd-debug.h"
@@ -1375,7 +1376,12 @@ struct mtmd_tokenizer {
                 img_u8.cpy_buf(bmp->get_ro_buf());
 
                 // preprocess image
+                phase_fields preproc_fields;
+                preproc_fields.image_w = bmp->nx;
+                preproc_fields.image_h = bmp->ny;
+                const auto preproc_span = phase_event("mtmd", "VISION_PREPROCESS_START", phase_kind::START, 0, preproc_fields);
                 mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
+                phase_event("mtmd", "VISION_PREPROCESS_END", phase_kind::END, preproc_span, preproc_fields);
 
                 // move entries and grid dimensions to the "global" preproc_out
                 for (auto & entry : tmp_preproc_out.entries) {
@@ -1715,6 +1721,7 @@ struct mtmd_tokenizer {
         if (vocab == nullptr) {
             throw std::runtime_error("llama_vocab is not provided");
         }
+        const auto tokenize_span = phase_event("mtmd", "TEXT_TOKENIZE_START", phase_kind::START);
         // upper limit for the number of tokens
         int n_tokens = text.length() + 2 * add_special;
         std::vector<llama_token> result(n_tokens);
@@ -1729,6 +1736,9 @@ struct mtmd_tokenizer {
         } else {
             result.resize(n_tokens);
         }
+        phase_fields tokenize_fields;
+        tokenize_fields.token_count = result.size();
+        phase_event("mtmd", "TEXT_TOKENIZE_END", phase_kind::END, tokenize_span, tokenize_fields);
         return result;
     }
 };

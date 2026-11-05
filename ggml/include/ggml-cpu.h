@@ -7,6 +7,23 @@
 extern "C" {
 #endif
 
+    struct ggml_cpu_attn_diag_link {
+        uint64_t graph_generation;
+        uint64_t execution_id;
+        uint64_t call_id;
+        int64_t request_id;
+        int64_t task_id;
+        int64_t slot_id;
+        int64_t ubatch_idx;
+        int32_t layer;
+        const char * stage;
+        const char * input_kind;
+    };
+
+    GGML_BACKEND_API void ggml_cpu_attn_diag_register_node(const struct ggml_tensor * node, uint64_t graph_generation, int32_t layer);
+    GGML_BACKEND_API int  ggml_cpu_attn_diag_bind_graph(const struct ggml_cgraph * graph, struct ggml_cpu_attn_diag_link link);
+    GGML_BACKEND_API void ggml_cpu_attn_diag_clear_generation(uint64_t graph_generation);
+
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287
     struct ggml_cplan {

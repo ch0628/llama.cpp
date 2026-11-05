@@ -365,6 +365,10 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    uint64_t attn_graph_generation = 0;
+    int64_t phase_prev_n_tokens = -1;
+    int64_t phase_prev_n_kv = -1;
+    int64_t phase_prev_n_stream = -1;
     llm_graph_result_ptr gf_res_reserve;
 
     // host buffer for the model output (logits and embeddings)

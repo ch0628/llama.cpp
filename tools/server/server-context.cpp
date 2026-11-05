@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "phase-events.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -118,6 +119,8 @@ struct server_batch {
         llama_pos pos;
         bool output;
         bool is_prompt; // for stats tracking
+        bool generated_token;
+        int64_t text_chunk_idx;
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
@@ -153,22 +156,22 @@ struct server_batch {
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt, bool generated_token = false, int64_t text_chunk_idx = -1) {
         GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, token, pos, output, is_prompt });
+        tokens.push_back({ id_slot, token, pos, output, is_prompt, generated_token, text_chunk_idx });
         return true;
     }
 
-    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt) {
+    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt, bool generated_token = false) {
         GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt, generated_token, -1 });
         has_embd = true;
         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
         return true;
@@ -509,9 +512,9 @@ struct server_slot {
             i_batch = batch.size();
 
             if (!inp_embd.empty()) {
-                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, inp_embd, prompt.tokens.pos_next(), true, false, true);
             } else {
-                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
+                add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false, true);
             }
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
@@ -1822,6 +1825,15 @@ private:
         slot.state = slot.task->is_child()
             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
             : SLOT_STATE_STARTED;
+        if (slot.state == SLOT_STATE_STARTED) {
+            phase_fields fields;
+            fields.task_id = slot.task->id;
+            fields.slot_id = slot.id;
+            phase_event("server", "SERVER_INFERENCE_START", phase_kind::POINT, 0, fields);
+            fields.request_id = fields.task_id;
+            fields.seq_id = slot.id;
+            phase_kv_snapshot(ctx_tgt, "KV_PRE_REQUEST", fields);
+        }
 
         // reset server kill-switch counter
         n_empty_consecutive = 0;
@@ -1958,6 +1970,17 @@ private:
 
         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
 
+        if (!slot.has_next_token) {
+            phase_fields fields;
+            fields.task_id = slot.task->id;
+            fields.slot_id = slot.id;
+            fields.token_count = slot.stats.n_gen;
+            phase_event("server", "DECODE_END", phase_kind::POINT, 0, fields);
+            fields.request_id = fields.task_id;
+            fields.seq_id = slot.id;
+            fields.call_id = phase_last_prefill_call(fields.request_id);
+            phase_kv_snapshot(ctx_tgt, "KV_DECODE_END", fields);
+        }
         return slot.has_next_token; // continue
     }
 
@@ -2087,6 +2110,10 @@ private:
     }
 
     void send_final_response(server_slot & slot) {
+        phase_fields response_fields;
+        response_fields.task_id = slot.task->id;
+        response_fields.slot_id = slot.id;
+        const auto response_span = phase_event("server", "SERVER_FINAL_RESPONSE_START", phase_kind::START, 0, response_fields);
         auto res = std::make_unique<server_task_result_cmpl_final>();
 
         res->id      = slot.task->id;
@@ -2147,6 +2174,10 @@ private:
         res->generation_params = slot.task->params; // copy the parameters
 
         queue_results.send(std::move(res));
+        phase_event("server", "SERVER_FINAL_RESPONSE_RETURN", phase_kind::END, response_span, response_fields);
+        if (!phase_flush()) {
+            SRV_WRN("%s", "failed to write phase events\n");
+        }
     }
 
     void send_embedding(const server_slot & slot, const llama_batch & batch) {
@@ -3493,7 +3524,16 @@ private:
                         size_t n_tokens_out = 0;
                         int32_t res = 0;
                         queue_tasks.yield_to_queue([&]() {
-                            res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            auto & request = phase_active_request();
+                            const auto previous = request;
+                            request = { slot.task->id, slot.task->id, slot.id, input_tokens.media_chunk_at(cur_token_idx) };
+                            try {
+                                res = process_mtmd_chunk(slot, slot.mbatch, cur_token_idx, n_tokens_out);
+                            } catch (...) {
+                                request = previous;
+                                throw;
+                            }
+                            request = previous;
                         });
 
                         if (res != 0) {
@@ -3543,7 +3583,9 @@ private:
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
                             /* output    = */ slot.need_embd(),
-                            /* is_prompt = */ true);
+                            /* is_prompt = */ true,
+                            /* generated_token = */ false,
+                            input_tokens.text_chunk_at(slot.prompt.n_tokens()));
                         slot.prompt.tokens.push_back(cur_tok);
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
@@ -3675,11 +3717,105 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        bool is_prompt = batch.tokens[off].is_prompt;
+        bool one_phase = true;
+        bool any_prompt = is_prompt;
+        bool all_prompt = is_prompt;
+        bool all_generated = batch.tokens[off].generated_token;
+        bool all_text = true;
+        const int32_t phase_slot_id = batch.tokens[off].id_slot;
+        int64_t text_chunk_idx = batch.tokens[off].text_chunk_idx;
+        for (int i = off; i < off + batch_view.n_tokens; ++i) {
+            one_phase &= batch.tokens[i].is_prompt == is_prompt && batch.tokens[i].id_slot == phase_slot_id;
+            any_prompt |= batch.tokens[i].is_prompt;
+            all_prompt &= batch.tokens[i].is_prompt;
+            all_generated &= batch.tokens[i].generated_token;
+            all_text &= batch.tokens[i].is_prompt && batch.tokens[i].text_chunk_idx >= 0 && batch_view.token != nullptr;
+            if (batch.tokens[i].text_chunk_idx != text_chunk_idx) {
+                text_chunk_idx = -1;
+            }
+        }
+        phase_fields decode_fields;
+        decode_fields.slot_id = phase_slot_id;
+        if (batch.slot_batched && batch.slot_batched->id == phase_slot_id && batch.slot_batched->task) {
+            decode_fields.task_id = batch.slot_batched->task->id;
+        }
+        decode_fields.token_count = batch_view.n_tokens;
+        decode_fields.q_len = batch_view.n_tokens;
+        decode_fields.sub_idx = off;
+        decode_fields.seq_id = one_phase ? phase_slot_id : -1;
+        decode_fields.item_idx = text_chunk_idx;
+        decode_fields.request_id = decode_fields.task_id;
+        decode_fields.input_kind = all_prompt && all_text ? "TEXT" : (any_prompt && !all_prompt ? "MIXED" : "UNKNOWN");
+        decode_fields.pos_start = batch.tokens[off].pos;
+        decode_fields.pos_end = batch.tokens[off + batch_view.n_tokens - 1].pos;
+        if (one_phase && batch_view.n_tokens == 1 && !is_prompt && batch.tokens[off].generated_token &&
+                batch.slot_batched && batch.slot_batched->id == phase_slot_id &&
+                batch.slot_batched->state == SLOT_STATE_GENERATING && !batch.slot_batched->can_speculate()) {
+            decode_fields.decode_step_idx = batch.slot_batched->stats.n_gen;
+        }
+        if (!one_phase) {
+            decode_fields.note = "mixed_prompt_or_slot";
+            phase_event("server", "MIXED_BATCH_SKIPPED", phase_kind::POINT, 0, decode_fields);
+        }
+
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
-            ret = llama_decode(ctx_tgt, batch_view);
+            const bool legacy_text = one_phase && is_prompt && all_text;
+            const bool legacy_decode = one_phase && !is_prompt;
+            const auto generic_span = any_prompt ? phase_event("server", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
+            const auto decode_span = legacy_text || legacy_decode ? phase_event("server", legacy_text ? "TEXT_PREFILL_CALL_START" : "GENERATED_TOKEN_EVAL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
+            if (generic_span || decode_span) {
+                decode_fields.call_id = generic_span ? generic_span : decode_span;
+                phase_set_call(decode_span ? decode_span : generic_span, decode_fields.decode_step_idx);
+                auto link_fields = decode_fields;
+                if (!one_phase) {
+                    link_fields.request_id = -1;
+                    link_fields.task_id = -1;
+                    link_fields.slot_id = -1;
+                    link_fields.input_kind = any_prompt ? "MIXED" : "UNKNOWN";
+                }
+                phase_set_link(link_fields, !one_phase || (any_prompt && !all_prompt) ? "MIXED" : any_prompt ? "PREFILL" : all_generated ? "DECODE" : "UNKNOWN");
+            }
+            if (any_prompt) {
+                phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_BEFORE", decode_fields);
+            }
+            const uint64_t call_start_ns = phase_now_ns();
+            try {
+                ret = llama_decode(ctx_tgt, batch_view);
+            } catch (...) {
+                if (any_prompt) {
+                    decode_fields.note = "exception";
+                    decode_fields.duration_ns = phase_now_ns() - call_start_ns;
+                    phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                    phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_AFTER", decode_fields);
+                }
+                phase_set_call(0);
+                phase_flush();
+                throw;
+            }
+            decode_fields.duration_ns = phase_now_ns() - call_start_ns;
+            decode_fields.status = ret;
+            if (decode_span) {
+                auto legacy_fields = decode_fields;
+                legacy_fields.call_id = decode_span;
+                phase_event("server", legacy_text ? "TEXT_PREFILL_CALL_RETURN" : "GENERATED_TOKEN_EVAL_CALL_RETURN", phase_kind::CALL_RETURN, decode_span, legacy_fields);
+            }
+            if (any_prompt) {
+                phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_AFTER", decode_fields);
+            }
+            phase_set_call(0);
+            if (ret != 0 && any_prompt) {
+                phase_flush();
+            }
+            if (ret == 0 && phase_sync_validate()) {
+                const auto sync_span = phase_event("server", "LLM_SYNC_START", phase_kind::START, 0, decode_fields);
+                llama_synchronize(ctx_tgt);
+                phase_event("server", "LLM_SYNC_END", phase_kind::END, sync_span, decode_fields);
+            }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
@@ -3835,6 +3971,14 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+                phase_fields fields;
+                fields.task_id = slot.task->id;
+                fields.slot_id = slot.id;
+                phase_event("server", "PREFILL_SUBMISSION_COMPLETE", phase_kind::POINT, 0, fields);
+                fields.request_id = fields.task_id;
+                fields.seq_id = slot.id;
+                fields.call_id = phase_last_prefill_call(fields.request_id);
+                phase_kv_snapshot(ctx_tgt, "KV_PREFILL_END", fields);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
@@ -3853,7 +3997,19 @@ private:
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
+                if (slot.stats.n_gen == 0) {
+                    phase_fields fields;
+                    fields.task_id = slot.task->id;
+                    fields.slot_id = slot.id;
+                    phase_event("server", "DECODE_START", phase_kind::POINT, 0, fields);
+                }
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                phase_fields fields;
+                fields.task_id = slot.task->id;
+                fields.slot_id = slot.id;
+                fields.item_idx = slot.stats.n_gen;
+                fields.token_id = id;
+                phase_event("server", "TOKEN_READY", phase_kind::POINT, 0, fields);
             }
 
             slot.i_batch = -1;

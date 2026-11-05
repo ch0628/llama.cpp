@@ -1,12 +1,16 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-cpu.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-attention-diagnostic.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-phase-events.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -14,11 +18,47 @@
 #include "llama.h"
 
 #include <cinttypes>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+phase_log & phase_logger() {
+    static phase_log log;
+    return log;
+}
+
+static std::atomic<uint64_t> attn_diag_next_id { 0 };
+
+phase_call_context & phase_active_call() {
+    static thread_local phase_call_context call;
+    return call;
+}
+
+uint64_t & phase_active_graph_generation() {
+    static thread_local uint64_t generation = 0;
+    return generation;
+}
+
+phase_request_context & phase_active_request() {
+    static thread_local phase_request_context request;
+    return request;
+}
+
+void phase_kv_snapshot(const llama_context * ctx, const char * name, phase_fields fields) {
+    if (!phase_events_path() || !ctx) {
+        return;
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory())) {
+        kv->fill_phase_snapshot(fields);
+        if (fields.kv_backend_bytes == 0) {
+            return;
+        }
+        phase_event("kv", name, phase_kind::POINT, 0, fields);
+    }
+}
 
 //
 // llama_context
@@ -393,6 +433,7 @@ llama_context::llama_context(
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
+        phase_kv_snapshot(this, "KV_ALLOCATION_READY");
     }
 
     // init backends
@@ -481,6 +522,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (llama_attn_diagnostic_enabled()) {
+        ggml_cpu_attn_diag_clear_generation(attn_graph_generation);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1338,6 +1382,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    phase_fields graph_fields;
+    if (phase_events_path()) {
+        graph_fields.token_count = ubatch.n_tokens;
+        graph_fields.n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+        graph_fields.seq_id = ubatch.n_seqs_unq == 1 ? ubatch.seq_id_unq[0] : -1;
+        graph_fields.prev_n_tokens = phase_prev_n_tokens;
+        graph_fields.prev_n_kv = phase_prev_n_kv;
+        graph_fields.prev_n_stream = phase_prev_n_stream;
+        if (const auto * kv_ctx = dynamic_cast<const llama_kv_cache_context *>(mctx)) {
+            graph_fields.attention_n_kv = kv_ctx->get_n_kv();
+        }
+        phase_event("llama", "GRAPH_PREP_START", phase_kind::POINT, 0, graph_fields);
+    }
+
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
 
@@ -1345,7 +1403,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    const bool graph_reused = !graph_reuse_disable && res->can_reuse(gparams);
+    if (phase_events_path()) {
+        graph_fields.graph_reused = graph_reused;
+        if (graph_reuse_disable) {
+            graph_fields.note = "reuse_disabled";
+        }
+    }
+
+    if (graph_reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1357,6 +1423,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        if (llama_attn_diagnostic_enabled()) {
+            ggml_cpu_attn_diag_clear_generation(attn_graph_generation);
+            attn_graph_generation = ++attn_diag_next_id;
+        }
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1364,7 +1434,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        phase_event("llama", "GRAPH_BUILD_START", phase_kind::POINT);
+        if (llama_attn_diagnostic_enabled()) {
+            phase_active_graph_generation() = attn_graph_generation;
+        }
+        try {
+            gf = model.build_graph(gparams);
+        } catch (...) {
+            phase_active_graph_generation() = 0;
+            throw;
+        }
+        phase_active_graph_generation() = 0;
+        phase_event("llama", "GRAPH_BUILD_END", phase_kind::POINT);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -1374,11 +1455,43 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        phase_event("llama", "GRAPH_ALLOC_START", phase_kind::POINT);
+        const bool graph_allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        phase_event("llama", "GRAPH_ALLOC_END", phase_kind::POINT);
+        if (!graph_allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+    }
+
+    if (phase_events_path()) {
+        phase_prev_n_tokens = ubatch.n_tokens;
+        phase_prev_n_kv = graph_fields.attention_n_kv;
+        phase_prev_n_stream = graph_fields.n_stream;
+        phase_event("llama", "GRAPH_PREP_END", phase_kind::POINT, 0, graph_fields);
+    }
+
+    if (llama_attn_diagnostic_enabled()) {
+        const auto & call = phase_active_call();
+        ggml_cpu_attn_diag_link link = {};
+        link.graph_generation = attn_graph_generation;
+        link.execution_id = ++attn_diag_next_id;
+        link.call_id = call.link_call_id;
+        link.request_id = call.request_id;
+        link.task_id = call.task_id;
+        link.slot_id = call.slot_id;
+        link.ubatch_idx = call.ubatch_idx;
+        link.stage = call.stage;
+        link.input_kind = call.input_kind;
+        const int bound_nodes = ggml_cpu_attn_diag_bind_graph(res->get_gf(), link);
+        flockfile(stderr);
+        std::fprintf(stderr, "ATTN_DIAG event=UBATCH graph=%p graph_generation=%llu execution_id=%llu bound_nodes=%d request_id=%lld task_id=%lld slot_id=%lld call_id=%llu ubatch_idx=%lld stage=%s input_kind=%s tokens=%u seqs=%u reused=%d\n",
+            static_cast<void *>(res->get_gf()), (unsigned long long) link.graph_generation, (unsigned long long) link.execution_id,
+            bound_nodes, (long long) link.request_id, (long long) link.task_id, (long long) link.slot_id,
+            (unsigned long long) link.call_id, (long long) link.ubatch_idx, link.stage, link.input_kind,
+            ubatch.n_tokens, ubatch.n_seqs_unq, int(graph_reused));
+        funlockfile(stderr);
     }
 
     // set the input data for the input tensors
@@ -1391,7 +1504,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    phase_event("llama", "GRAPH_COMPUTE_START", phase_kind::POINT);
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    phase_fields compute_fields;
+    compute_fields.status = status;
+    phase_event("llama", "GRAPH_COMPUTE_RETURN", phase_kind::POINT, 0, compute_fields);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1656,6 +1773,22 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    if (phase_diagnostic() && batch_inp.n_tokens == 1 && (!batch_inp.n_seq_id || batch_inp.n_seq_id[0] > 0)) {
+        const llama_seq_id seq_id = batch_inp.seq_id ? batch_inp.seq_id[0][0] : 0;
+        if (seq_id >= 0 && (uint32_t) seq_id < (cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max)) {
+            if (const auto * kv = dynamic_cast<const llama_kv_cache *>(memory.get())) {
+                const auto & cells = kv->get_cells(seq_id);
+                phase_fields fields;
+                fields.seq_id = seq_id;
+                fields.stream_id = kv->get_stream_for_seq(seq_id);
+                fields.kv_used_cells = cells.get_used();
+                fields.kv_used_max_p1 = cells.used_max_p1();
+                fields.token_count = batch_inp.n_tokens;
+                phase_event("llama", "KV_PRE_CALL", phase_kind::POINT, 0, fields);
+            }
+        }
+    }
+
     const auto & vocab   = model.vocab;
     const auto & hparams = model.hparams;
 
@@ -1802,9 +1935,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
+    int64_t phase_ubatch_idx = 0;
 
     do {
         const auto & ubatch = mctx->get_ubatch();
+        if (phase_events_path() || llama_attn_diagnostic_enabled()) {
+            phase_active_call().ubatch_idx = phase_ubatch_idx;
+        }
+        phase_ubatch_idx++;
 
         // count the outputs in this ubatch
         {

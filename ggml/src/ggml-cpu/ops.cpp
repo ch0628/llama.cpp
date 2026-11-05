@@ -11,6 +11,132 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <iterator>
+#include <map>
+#include <mutex>
+#include <unordered_map>
+
+static bool ggml_cpu_attn_diagnostic_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_ATTN_DIAGNOSTIC");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool ggml_cpu_kvb_diagnostic_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_KVB_DIAGNOSTIC");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+struct ggml_cpu_kvb_work {
+    uint64_t dot_calls = 0;
+    uint64_t skipped_candidates = 0;
+    uint64_t gemm_calls = 0;
+    uint64_t skipped_tiles = 0;
+    uint64_t partial_tiles = 0;
+    uint64_t full_tiles = 0;
+    uint64_t qk_elements = 0;
+    uint64_t logical_elements = 0;
+    std::map<std::pair<int, int>, uint64_t> tile_shapes;
+};
+
+struct ggml_cpu_attn_diag_entry {
+    uint64_t graph_generation;
+    int32_t layer;
+    ggml_cpu_attn_diag_link link = {};
+};
+
+static std::mutex ggml_cpu_attn_diag_mutex;
+static std::unordered_map<const ggml_tensor *, ggml_cpu_attn_diag_entry> ggml_cpu_attn_diag_nodes;
+
+extern "C" void ggml_cpu_attn_diag_register_node(const ggml_tensor * node, uint64_t graph_generation, int32_t layer) {
+    if (!ggml_cpu_attn_diagnostic_enabled() || !graph_generation) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    ggml_cpu_attn_diag_nodes[node] = { graph_generation, layer, {} };
+}
+
+extern "C" int ggml_cpu_attn_diag_bind_graph(const ggml_cgraph * graph, ggml_cpu_attn_diag_link link) {
+    if (!ggml_cpu_attn_diagnostic_enabled()) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    int count = 0;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        auto it = ggml_cpu_attn_diag_nodes.find(graph->nodes[i]);
+        if (it != ggml_cpu_attn_diag_nodes.end() && it->second.graph_generation == link.graph_generation) {
+            it->second.link = link;
+            it->second.link.layer = it->second.layer;
+            ++count;
+        }
+    }
+    return count;
+}
+
+extern "C" void ggml_cpu_attn_diag_clear_generation(uint64_t graph_generation) {
+    if (!graph_generation) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    for (auto it = ggml_cpu_attn_diag_nodes.begin(); it != ggml_cpu_attn_diag_nodes.end();) {
+        it = it->second.graph_generation == graph_generation ? ggml_cpu_attn_diag_nodes.erase(it) : std::next(it);
+    }
+}
+
+static ggml_cpu_attn_diag_link ggml_cpu_attn_diag_lookup(const ggml_tensor * node) {
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    const auto it = ggml_cpu_attn_diag_nodes.find(node);
+    if (it != ggml_cpu_attn_diag_nodes.end()) {
+        return it->second.link;
+    }
+    ggml_cpu_attn_diag_link unlinked = {};
+    unlinked.request_id = -1;
+    unlinked.task_id = -1;
+    unlinked.slot_id = -1;
+    unlinked.ubatch_idx = -1;
+    unlinked.layer = -1;
+    return unlinked;
+}
+
+static void ggml_cpu_attn_diag_print_link(const ggml_cpu_attn_diag_link & link) {
+    std::fprintf(stderr, " linked=%d graph_generation=%llu execution_id=%llu request_id=%lld task_id=%lld slot_id=%lld call_id=%llu ubatch_idx=%lld layer=%d stage=%s input_kind=%s",
+        int(link.execution_id != 0), (unsigned long long) link.graph_generation, (unsigned long long) link.execution_id,
+        (long long) link.request_id, (long long) link.task_id, (long long) link.slot_id,
+        (unsigned long long) link.call_id, (long long) link.ubatch_idx, link.layer,
+        link.stage ? link.stage : "UNKNOWN", link.input_kind ? link.input_kind : "UNKNOWN");
+}
+
+static void ggml_cpu_kvb_print_work(const ggml_tensor * dst, const char * path, int ith, int nth,
+                                    int64_t ic_start, int64_t ic_end, const ggml_cpu_kvb_work & work) {
+    const auto link = ggml_cpu_attn_diag_lookup(dst);
+    flockfile(stderr);
+    std::fprintf(stderr, "KVB_DIAG event=CPU_WORK node=%p path=%s ith=%d nth=%d kv_start=%lld kv_end=%lld dot_calls=%llu skipped_candidates=%llu gemm_calls=%llu skipped_tiles=%llu partial_tiles=%llu full_tiles=%llu qk_elements=%llu logical_elements=%llu padding_elements=%llu shapes=",
+        static_cast<const void *>(dst), path, ith, nth, (long long) ic_start, (long long) ic_end,
+        (unsigned long long) work.dot_calls, (unsigned long long) work.skipped_candidates,
+        (unsigned long long) work.gemm_calls, (unsigned long long) work.skipped_tiles,
+        (unsigned long long) work.partial_tiles, (unsigned long long) work.full_tiles,
+        (unsigned long long) work.qk_elements, (unsigned long long) work.logical_elements,
+        (unsigned long long) (work.qk_elements - work.logical_elements));
+    bool first = true;
+    for (const auto & item : work.tile_shapes) {
+        std::fprintf(stderr, "%s%dx%d:%llu", first ? "" : ";", item.first.first, item.first.second,
+            (unsigned long long) item.second);
+        first = false;
+    }
+    if (first) {
+        std::fprintf(stderr, "none");
+    }
+    ggml_cpu_attn_diag_print_link(link);
+    std::fprintf(stderr, "\n");
+    funlockfile(stderr);
+}
 
 // ggml_compute_forward_dup
 
@@ -494,7 +620,6 @@ static void ggml_compute_forward_dup_from_q(
 
     const int ith = params->ith;
     const int nth = params->nth;
-
     const int dr = (nr + nth - 1)/nth;
 
     // row range for this thread
@@ -8616,7 +8741,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         ggml_tensor * dst,
         int ir0, int ir1,
         int64_t ic_start, int64_t ic_end,
-        float * partials, int64_t partial_stride) {
+        float * partials, int64_t partial_stride,
+        ggml_cpu_kvb_work * kvb_work) {
 
     const bool write_partials = (partials != nullptr);
     const ggml_tensor * q     = dst->src[0];
@@ -8738,12 +8864,18 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
             const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
             if (mv == -INFINITY) {
+                if (kvb_work) {
+                    ++kvb_work->skipped_candidates;
+                }
                 continue;
             }
 
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            if (kvb_work) {
+                ++kvb_work->dot_calls;
+            }
             kq_vec_dot(DK, &s, 0, k_data, 0, Q_q, 0, 1);
 
             s = s*scale; // scale KQ value
@@ -8852,7 +8984,8 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
-        int ir0, int ir1) {
+        int ir0, int ir1,
+        ggml_cpu_kvb_work * kvb_work) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -8994,6 +9127,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int)std::min((int64_t)KV_TILE_SZ, nek1 - ic);
+            int masked_in_tile = 0;
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -9004,6 +9138,8 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                         mask32[tq * KV_TILE_SZ + tk] = slope * GGML_CPU_FP16_TO_FP32(mp_row[ic + tk]);
                         if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
                             can_skip = false;
+                        } else if (kvb_work) {
+                            ++masked_in_tile;
                         }
                     }
                     // Pad remaining mask entries with -inf
@@ -9013,7 +9149,22 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 }
 
                 if (can_skip) {
+                    if (kvb_work) {
+                        ++kvb_work->skipped_tiles;
+                    }
                     continue;
+                }
+            }
+
+            if (kvb_work) {
+                ++kvb_work->gemm_calls;
+                ++kvb_work->tile_shapes[{tile_rows, kv_tile}];
+                kvb_work->qk_elements += uint64_t(Q_TILE_SZ)*KV_TILE_SZ;
+                kvb_work->logical_elements += uint64_t(tile_rows)*kv_tile;
+                if (masked_in_tile) {
+                    ++kvb_work->partial_tiles;
+                } else {
+                    ++kvb_work->full_tiles;
                 }
             }
 
@@ -9254,6 +9405,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    ggml_cpu_kvb_work kvb_work;
+    ggml_cpu_kvb_work * work = ggml_cpu_kvb_diagnostic_enabled() ? &kvb_work : nullptr;
+
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
 
@@ -9262,6 +9416,22 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
+
+        if (ith == 0 && ggml_cpu_attn_diagnostic_enabled()) {
+            flockfile(stderr);
+            std::fprintf(stderr, "ATTN_DIAG event=CPU_FLASH node=%p path=SPLIT_KV ith=0 nth=%d use_ref=%d q_type=%s k_type=%s v_type=%s neq1=%lld neq2=%lld neq3=%lld nek1=%lld DK=%lld DV=%lld mask=%d q_tile=%d kv_tile=%d chunk_size=%lld chunks=",
+                static_cast<void *>(dst), nth, int(use_ref), ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v->type),
+                (long long) neq1, (long long) neq2, (long long) neq3, (long long) nek1, (long long) DK, (long long) DV,
+                int(dst->src[3] != nullptr), int(ggml_fa_tile_config::Q), int(ggml_fa_tile_config::KV), (long long) chunk_size);
+            for (int t = 0; t < nth; ++t) {
+                const int64_t start = std::min((int64_t) t * chunk_size, nek1);
+                const int64_t end = std::min(start + chunk_size, nek1);
+                std::fprintf(stderr, "%s%d:%lld-%lld", t ? ";" : "", t, (long long) start, (long long) end);
+            }
+            ggml_cpu_attn_diag_print_link(ggml_cpu_attn_diag_lookup(dst));
+            std::fprintf(stderr, "\n");
+            funlockfile(stderr);
+        }
 
         // Partials buffer layout: [q_head][kv_chunk][M, S, VKQ]
         const int64_t partial_size  = 2 + DV;
@@ -9277,7 +9447,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,
-                    chunk_partials, partial_stride);
+                    chunk_partials, partial_stride, work);
             }
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
@@ -9289,6 +9459,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
         ggml_barrier(params->threadpool);
         ggml_flash_attn_ext_reduce_partials(params, dst, nth, chunk_size);
+        if (work) {
+            ggml_cpu_kvb_print_work(dst, "SPLIT_KV", ith, nth, ic_start, ic_end, kvb_work);
+        }
     } else {
 
         // total rows in q
@@ -9328,6 +9501,23 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+        if (ith == 0 && ggml_cpu_attn_diagnostic_enabled()) {
+            flockfile(stderr);
+            std::fprintf(stderr, "ATTN_DIAG event=CPU_FLASH node=%p path=%s ith=0 nth=%d use_ref=%d q_type=%s k_type=%s v_type=%s neq1=%lld neq2=%lld neq3=%lld nek1=%lld DK=%lld DV=%lld mask=%d q_tile=%lld kv_tile=%d rows=%lld row_chunks=%lld row_chunk_size=%lld simd_f32_epr=%lld",
+                static_cast<void *>(dst), use_tiled ? "TILED" : "ONE_CHUNK", nth, int(use_ref),
+                ggml_type_name(q->type), ggml_type_name(k->type), ggml_type_name(v->type),
+                (long long) neq1, (long long) neq2, (long long) neq3, (long long) nek1, (long long) DK, (long long) DV,
+                int(dst->src[3] != nullptr), (long long) Q_TILE_SZ, int(ggml_fa_tile_config::KV),
+                (long long) nr, (long long) nchunk, (long long) dr,
+#ifdef GGML_SIMD
+                (long long) f32_epr);
+#else
+                0LL);
+#endif
+            ggml_cpu_attn_diag_print_link(ggml_cpu_attn_diag_lookup(dst));
+            std::fprintf(stderr, "\n");
+            funlockfile(stderr);
+        }
         int current_chunk = ith;
 
         while (current_chunk < nchunk) {
@@ -9335,12 +9525,15 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
             if (use_tiled) {
-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
+                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1, work);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0, work);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
+        }
+        if (work) {
+            ggml_cpu_kvb_print_work(dst, use_tiled ? "TILED" : "ONE_CHUNK", ith, nth, 0, nek1, kvb_work);
         }
     }
 }

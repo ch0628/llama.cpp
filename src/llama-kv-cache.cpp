@@ -1,4 +1,6 @@
 #include "llama-kv-cache.h"
+#include "llama-phase-events.h"
+#include "llama-attention-diagnostic.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -1202,6 +1204,19 @@ uint32_t llama_kv_cache::get_size() const {
     return cells.size();
 }
 
+void llama_kv_cache::fill_phase_snapshot(phase_fields & fields) const {
+    const uint32_t stream = fields.seq_id >= 0 && (size_t) fields.seq_id < seq_to_stream.size()
+        ? seq_to_stream[fields.seq_id] : 0;
+    const auto & cells = v_cells[stream];
+    fields.stream_id = stream;
+    fields.kv_capacity_cells = get_size();
+    fields.kv_used_cells = cells.get_used();
+    fields.kv_used_max_p1 = cells.used_max_p1();
+    fields.kv_k_logical_bytes = size_k_bytes();
+    fields.kv_v_logical_bytes = size_v_bytes();
+    fields.kv_backend_bytes = total_size();
+}
+
 uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
@@ -1245,6 +1260,11 @@ const llama_kv_cells & llama_kv_cache::get_cells(llama_seq_id seq_id) const {
     GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
 
     return v_cells[seq_to_stream[seq_id]];
+}
+
+uint32_t llama_kv_cache::get_stream_for_seq(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+    return seq_to_stream[seq_id];
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
@@ -1778,6 +1798,85 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+
+    if (llama_kvb_diagnostic_enabled()) {
+        GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+        const auto & call = phase_active_call();
+        int64_t valid_pairs = 0;
+        int64_t unique_keys = 0;
+        std::vector<uint8_t> seen(n_stream*n_kv, 0);
+        flockfile(stderr);
+        for (int64_t s = 0; s < n_stream; ++s) {
+            for (int64_t iq = 0; iq < n_tps; ++iq) {
+                const int64_t row = s*n_tps + iq;
+                int64_t valid = 0;
+                for (int64_t key = 0; key < n_kv; ++key) {
+                    const int64_t index = row*n_kv + key;
+                    const float value = dst->type == GGML_TYPE_F16
+                        ? ggml_fp16_to_fp32(static_cast<const ggml_fp16_t *>(dst->data)[index])
+                        : static_cast<const float *>(dst->data)[index];
+                    if (value != -INFINITY) {
+                        ++valid;
+                        if (!seen[s*n_kv + key]) {
+                            seen[s*n_kv + key] = 1;
+                            ++unique_keys;
+                        }
+                    }
+                }
+                valid_pairs += valid;
+                std::fprintf(stderr, "KVB_DIAG event=MASK_ROW mask=%p call_id=%llu ubatch_idx=%lld stream=%lld seq_id=%d query=%lld n_kv=%lld valid=%lld masked=%lld\n",
+                    static_cast<void *>(dst), (unsigned long long) call.link_call_id, (long long) call.ubatch_idx,
+                    (long long) s, int(ubatch->seq_id[row][0]), (long long) iq, (long long) n_kv,
+                    (long long) valid, (long long) (n_kv - valid));
+            }
+        }
+        std::fprintf(stderr, "KVB_DIAG event=MASK_SUM mask=%p call_id=%llu ubatch_idx=%lld type=%s shape=%lld,%lld,%lld,%lld n_kv=%lld queries=%u streams=%lld head_broadcast=%lld candidates=%lld valid=%lld masked=%lld unique_keys=%lld\n",
+            static_cast<void *>(dst), (unsigned long long) call.link_call_id, (long long) call.ubatch_idx,
+            ggml_type_name(dst->type), (long long) dst->ne[0], (long long) dst->ne[1],
+            (long long) dst->ne[2], (long long) dst->ne[3], (long long) n_kv, n_tokens,
+            (long long) n_stream, (long long) dst->ne[2], (long long) (n_tokens*n_kv),
+            (long long) valid_pairs, (long long) (n_tokens*n_kv - valid_pairs), (long long) unique_keys);
+        funlockfile(stderr);
+    }
+
+    if (phase_diagnostic() && phase_active_call().decode_step_idx > 0 && n_tokens == 1 && n_stream == 1) {
+        int64_t valid_count = 0;
+        int64_t masked_count = 0;
+        if (dst->type == GGML_TYPE_F16) {
+            const auto * data = static_cast<const ggml_fp16_t *>(dst->data);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (std::isfinite(ggml_fp16_to_fp32(data[j]))) {
+                    valid_count++;
+                } else {
+                    masked_count++;
+                }
+            }
+        } else if (dst->type == GGML_TYPE_F32) {
+            const auto * data = static_cast<const float *>(dst->data);
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (std::isfinite(data[j])) {
+                    valid_count++;
+                } else {
+                    masked_count++;
+                }
+            }
+        }
+        if (dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32) {
+            GGML_ASSERT(valid_count + masked_count == n_kv);
+            phase_fields fields;
+            fields.seq_id = ubatch->seq_id[0][0];
+            fields.stream_id = get_stream_for_seq(fields.seq_id);
+            fields.attention_n_kv = n_kv;
+            fields.valid_count = valid_count;
+            fields.masked_count = masked_count;
+            fields.token_count = n_tokens;
+            fields.query_idx = 0;
+            fields.key_start = 0;
+            fields.key_end = n_kv;
+            fields.note = dst->type == GGML_TYPE_F16 ? "f16" : "f32";
+            phase_event("llama", "KQ_MASK_VALID_COUNT", phase_kind::POINT, 0, fields);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();
@@ -2724,6 +2823,22 @@ bool llama_kv_cache_context::apply() {
 
     kv->apply_ubatch(sinfos[i_cur], ubatches[i_cur]);
     n_kv = kv->get_n_kv(sinfos[i_cur]);
+
+    if (phase_diagnostic()) {
+        const auto & ubatch = ubatches[i_cur];
+        if (ubatch.n_tokens == 1 && ubatch.n_seq_id[0] == 1) {
+            const llama_seq_id seq_id = ubatch.seq_id[0][0];
+            const auto & cells = kv->get_cells(seq_id);
+            phase_fields fields;
+            fields.seq_id = seq_id;
+            fields.stream_id = kv->get_stream_for_seq(seq_id);
+            fields.kv_used_cells = cells.get_used();
+            fields.kv_used_max_p1 = cells.used_max_p1();
+            fields.attention_n_kv = n_kv;
+            fields.token_count = ubatch.n_tokens;
+            phase_event("llama", "KV_POST_UBATCH_APPLY", phase_kind::POINT, 0, fields);
+        }
+    }
 
     return true;
 }

@@ -141,6 +141,13 @@ private: // disallow accessing these members directly, risking out-of-sync
     // map a **start** index in tokens to the image chunk
     // note: the order need to be in-sync with tokens
     std::map<size_t, mtmd::input_chunk_ptr> map_idx_to_media;
+    struct text_chunk_range {
+        size_t begin;
+        size_t end;
+        int64_t chunk_idx;
+    };
+    std::vector<text_chunk_range> text_chunks;
+    int64_t next_chunk_idx = 0;
 
     // list of tokens
     //   if the token is LLAMA_TOKEN_NULL, it indicates that this position is occupied by media chunk
@@ -186,6 +193,9 @@ public:
 
     const mtmd::input_chunk_ptr & find_chunk(size_t idx) const;
 
+    int64_t text_chunk_at(size_t idx) const;
+    int64_t media_chunk_at(size_t idx) const;
+
     // find next media chunk after idx
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
@@ -222,6 +232,8 @@ public:
 
     void clear() {
         map_idx_to_media.clear();
+        text_chunks.clear();
+        next_chunk_idx = 0;
         tokens.clear();
     }
 

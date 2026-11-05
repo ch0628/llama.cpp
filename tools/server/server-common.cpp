@@ -4,6 +4,7 @@
 #include "llama.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "phase-events.h"
 #include "chat.h"
 #include "base64.hpp"
 
@@ -369,6 +370,33 @@ server_tokens::server_tokens(mtmd::input_chunks & mtmd_chunks, bool has_mtmd) : 
 server_tokens::server_tokens(const llama_tokens & tokens, bool has_mtmd) : has_mtmd(has_mtmd), tokens(tokens) {
 }
 
+int64_t server_tokens::text_chunk_at(size_t idx) const {
+    for (const auto & range : text_chunks) {
+        if (range.begin <= idx && idx < range.end) {
+            return range.chunk_idx;
+        }
+    }
+    return -1;
+}
+
+int64_t server_tokens::media_chunk_at(size_t idx) const {
+    int64_t chunk_idx = 0;
+    for (const auto & range : text_chunks) {
+        if (range.begin < idx) {
+            ++chunk_idx;
+        }
+    }
+    for (const auto & entry : map_idx_to_media) {
+        if (entry.first == idx) {
+            return chunk_idx;
+        }
+        if (entry.first < idx) {
+            ++chunk_idx;
+        }
+    }
+    return -1;
+}
+
 llama_pos server_tokens::pos_next(int64_t n_tokens) const {
     if (!has_mtmd) {
         if (n_tokens < 0) {
@@ -499,12 +527,15 @@ void server_tokens::push_back(const mtmd_input_chunk * chunk) {
     } else if (type == MTMD_INPUT_CHUNK_TYPE_TEXT) {
         size_t n_tokens;
         const auto * text_tokens = mtmd_input_chunk_get_tokens_text(chunk, &n_tokens);
+        const size_t begin = tokens.size();
         for (size_t i = 0; i < n_tokens; ++i) {
             push_back(text_tokens[i]);
         }
+        text_chunks.push_back({ begin, tokens.size(), next_chunk_idx });
     } else {
         GGML_ABORT("Invalid chunk type");
     }
+    ++next_chunk_idx;
 }
 
 void server_tokens::push_back_placeholder(const mtmd_input_chunk * chunk) {
@@ -529,6 +560,10 @@ void server_tokens::push_back(server_tokens & tokens) {
     for (size_t i = 0; i < tokens.size(); i++) {
         push_back(tokens[i]);
     }
+    for (const auto & range : tokens.text_chunks) {
+        text_chunks.push_back({ start_idx + range.begin, start_idx + range.end, next_chunk_idx + range.chunk_idx });
+    }
+    next_chunk_idx += tokens.next_chunk_idx;
     if (tokens.has_mtmd) {
         // Assert if we are copying MTMD chunks to a server_tokens that does not have mtmd.
         // We could also just check, but this will prevent silently dropping MTMD data.
@@ -664,6 +699,14 @@ void server_tokens::keep_first(size_t n) {
         }
     }
     tokens.resize(n);
+    for (auto it = text_chunks.begin(); it != text_chunks.end(); ) {
+        if (it->begin >= n) {
+            it = text_chunks.erase(it);
+        } else {
+            it->end = std::min(it->end, n);
+            ++it;
+        }
+    }
 }
 
 std::string server_tokens::detokenize(const llama_context * ctx, bool special) const {
@@ -775,6 +818,8 @@ server_tokens server_tokens::clone() const {
     server_tokens res;
     res.has_mtmd = has_mtmd;
     res.tokens   = tokens;
+    res.text_chunks = text_chunks;
+    res.next_chunk_idx = next_chunk_idx;
     for (auto it = map_idx_to_media.begin(); it != map_idx_to_media.end(); ++it) {
         size_t idx = it->first;
         const mtmd::input_chunk_ptr & chunk = it->second;
@@ -1068,6 +1113,8 @@ static void handle_media(
         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
     }
 
+    const auto image_input_span = phase_event("server", "IMAGE_INPUT_START", phase_kind::START);
+
     if (string_starts_with(url, "http")) {
         // download remote image
         // TODO @ngxson : maybe make these params configurable
@@ -1128,6 +1175,7 @@ static void handle_media(
         }
         out_files.push_back(decoded_data);
     }
+    phase_event("server", "IMAGE_INPUT_END", phase_kind::END, image_input_span);
 }
 
 // used by /chat/completions endpoint
