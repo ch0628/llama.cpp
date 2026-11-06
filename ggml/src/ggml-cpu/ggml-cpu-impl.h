@@ -15,6 +15,13 @@
 extern "C" {
 #endif
 
+enum ggml_cpu_attn_kernel_path {
+    GGML_CPU_ATTN_KERNEL_NONE = 0,
+    GGML_CPU_ATTN_KERNEL_ONE_CHUNK,
+    GGML_CPU_ATTN_KERNEL_TILED,
+    GGML_CPU_ATTN_KERNEL_SPLIT_KV,
+};
+
 struct ggml_compute_params {
     // ith = thread index, nth = number of threads
     int ith, nth;
@@ -27,6 +34,8 @@ struct ggml_compute_params {
 
     // use reference implementation
     bool use_ref;
+
+    enum ggml_cpu_attn_kernel_path * attn_timing_path;
 };
 
 

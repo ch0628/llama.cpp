@@ -2727,22 +2727,24 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         }
     }
 
-    if (llama_attn_diagnostic_enabled()) {
+    if (llama_attn_linking_enabled()) {
         const uint64_t graph_generation = phase_active_graph_generation();
         if (use_flash_attn) {
             ggml_cpu_attn_diag_register_node(diag_op, graph_generation, il);
         }
-        flockfile(stderr);
-        std::fprintf(stderr, "ATTN_DIAG event=GRAPH_SELECT graph=%p graph_generation=%llu node=%p layer=%d choice=%s flash_enabled=%d kq_bias=%d ubatch_tokens=%u q=%p:%s:[%lld,%lld,%lld,%lld] k=%p:%s:[%lld,%lld,%lld,%lld] v=%p:%s:[%lld,%lld,%lld,%lld] mask=%p:%s:[%lld,%lld,%lld,%lld]\n",
-            static_cast<void *>(gf), (unsigned long long) graph_generation, static_cast<void *>(diag_op), il, use_flash_attn ? "FLASH" : "GENERAL",
-            int(cparams.flash_attn), int(kq_b != nullptr), ubatch.n_tokens,
-            static_cast<void *>(q), ggml_type_name(q->type), (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
-            static_cast<void *>(k), ggml_type_name(k->type), (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
-            static_cast<void *>(v), ggml_type_name(v->type), (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
-            static_cast<void *>(kq_mask), kq_mask ? ggml_type_name(kq_mask->type) : "NONE",
-            (long long) (kq_mask ? kq_mask->ne[0] : 0), (long long) (kq_mask ? kq_mask->ne[1] : 0),
-            (long long) (kq_mask ? kq_mask->ne[2] : 0), (long long) (kq_mask ? kq_mask->ne[3] : 0));
-        funlockfile(stderr);
+        if (llama_attn_diagnostic_enabled()) {
+            flockfile(stderr);
+            std::fprintf(stderr, "ATTN_DIAG event=GRAPH_SELECT graph=%p graph_generation=%llu node=%p layer=%d choice=%s flash_enabled=%d kq_bias=%d ubatch_tokens=%u q=%p:%s:[%lld,%lld,%lld,%lld] k=%p:%s:[%lld,%lld,%lld,%lld] v=%p:%s:[%lld,%lld,%lld,%lld] mask=%p:%s:[%lld,%lld,%lld,%lld]\n",
+                static_cast<void *>(gf), (unsigned long long) graph_generation, static_cast<void *>(diag_op), il, use_flash_attn ? "FLASH" : "GENERAL",
+                int(cparams.flash_attn), int(kq_b != nullptr), ubatch.n_tokens,
+                static_cast<void *>(q), ggml_type_name(q->type), (long long) q->ne[0], (long long) q->ne[1], (long long) q->ne[2], (long long) q->ne[3],
+                static_cast<void *>(k), ggml_type_name(k->type), (long long) k->ne[0], (long long) k->ne[1], (long long) k->ne[2], (long long) k->ne[3],
+                static_cast<void *>(v), ggml_type_name(v->type), (long long) v->ne[0], (long long) v->ne[1], (long long) v->ne[2], (long long) v->ne[3],
+                static_cast<void *>(kq_mask), kq_mask ? ggml_type_name(kq_mask->type) : "NONE",
+                (long long) (kq_mask ? kq_mask->ne[0] : 0), (long long) (kq_mask ? kq_mask->ne[1] : 0),
+                (long long) (kq_mask ? kq_mask->ne[2] : 0), (long long) (kq_mask ? kq_mask->ne[3] : 0));
+            funlockfile(stderr);
+        }
     }
 
     ggml_build_forward_expand(gf, cur);

@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "traits.h"
 #include "iqp.h"
 #include "ggml-cpu-impl.h"
@@ -478,6 +479,13 @@ typedef pthread_mutex_t    ggml_mutex_t;
 #endif
 
 // Threadpool def
+struct ggml_cpu_attn_timing_worker {
+    uint64_t start_ns;
+    uint64_t end_ns;
+    enum ggml_cpu_attn_kernel_path path;
+    bool attempted;
+};
+
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -500,6 +508,14 @@ struct ggml_threadpool {
     int          n_threads;   // Number of threads in the pool
     int32_t      prio;        // Scheduling priority
     uint32_t     poll;        // Polling level (0 - no polling)
+
+    struct ggml_cpu_attn_timing_worker * attn_timing_workers;
+    struct ggml_cpu_attn_diag_link * attn_timing_links;
+    size_t attn_timing_worker_capacity;
+    size_t attn_timing_link_capacity;
+    int attn_timing_n_nodes;
+    int attn_timing_n_threads;
+    bool attn_timing_active;
 
     enum ggml_status ec;
 };
@@ -2762,6 +2778,8 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
 
     const size_t workers_size = sizeof(struct ggml_compute_state) * n_threads;
     ggml_aligned_free(threadpool->workers, workers_size);
+    free(threadpool->attn_timing_workers);
+    free(threadpool->attn_timing_links);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
@@ -3063,6 +3081,8 @@ struct ggml_cplan ggml_graph_plan(
 // Try to fuse the current node with subsequent nodes for better performance.
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_attn_timing = false;     // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_attn_timing_raw = false; // initialized once in ggml_cpu_init(), read-only afterwards
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3098,6 +3118,138 @@ static int ggml_cpu_try_fuse_ops(
     return 0;
 }
 
+static uint64_t ggml_cpu_attn_timing_now_ns(void) {
+#ifdef CLOCK_MONOTONIC_RAW
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t) ts.tv_sec * 1000000000ULL + (uint64_t) ts.tv_nsec;
+#else
+    return 0;
+#endif
+}
+
+static const char * ggml_cpu_attn_timing_path_name(enum ggml_cpu_attn_kernel_path path) {
+    switch (path) {
+        case GGML_CPU_ATTN_KERNEL_ONE_CHUNK: return "ONE_CHUNK";
+        case GGML_CPU_ATTN_KERNEL_TILED:     return "TILED";
+        case GGML_CPU_ATTN_KERNEL_SPLIT_KV:  return "SPLIT_KV";
+        case GGML_CPU_ATTN_KERNEL_NONE:      return "UNKNOWN";
+    }
+    return "UNKNOWN";
+}
+
+static bool ggml_cpu_attn_timing_prepare(struct ggml_threadpool * tp, const struct ggml_cgraph * cgraph, int n_threads) {
+    tp->attn_timing_active = false;
+    tp->attn_timing_n_nodes = 0;
+    tp->attn_timing_n_threads = 0;
+
+    if (!ggml_cpu_attn_timing || cgraph->n_nodes <= 0 || n_threads <= 0) {
+        return false;
+    }
+
+    const size_t n_nodes = (size_t) cgraph->n_nodes;
+    const size_t n_workers = n_nodes * (size_t) n_threads;
+    if (n_workers / n_nodes != (size_t) n_threads || n_workers > SIZE_MAX / sizeof(struct ggml_cpu_attn_timing_worker)) {
+        fprintf(stderr, "ATTN_TIMING event=ERROR reason=SIZE_OVERFLOW nodes=%d workers=%d\n", cgraph->n_nodes, n_threads);
+        return false;
+    }
+
+    if (n_workers > tp->attn_timing_worker_capacity || n_nodes > tp->attn_timing_link_capacity) {
+        struct ggml_cpu_attn_timing_worker * workers = malloc(n_workers * sizeof(*workers));
+        struct ggml_cpu_attn_diag_link * links = malloc(n_nodes * sizeof(*links));
+        if (!workers || !links) {
+            free(workers);
+            free(links);
+            fprintf(stderr, "ATTN_TIMING event=ERROR reason=ALLOC_FAILED nodes=%d workers=%d\n", cgraph->n_nodes, n_threads);
+            return false;
+        }
+        free(tp->attn_timing_workers);
+        free(tp->attn_timing_links);
+        tp->attn_timing_workers = workers;
+        tp->attn_timing_links = links;
+        tp->attn_timing_worker_capacity = n_workers;
+        tp->attn_timing_link_capacity = n_nodes;
+    }
+
+    memset(tp->attn_timing_workers, 0, n_workers * sizeof(*tp->attn_timing_workers));
+    memset(tp->attn_timing_links, 0, n_nodes * sizeof(*tp->attn_timing_links));
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        if (cgraph->nodes[node_n]->op == GGML_OP_FLASH_ATTN_EXT) {
+            ggml_cpu_attn_diag_get_link(cgraph->nodes[node_n], &tp->attn_timing_links[node_n]);
+        }
+    }
+
+    tp->attn_timing_n_nodes = cgraph->n_nodes;
+    tp->attn_timing_n_threads = n_threads;
+    tp->attn_timing_active = true;
+    return true;
+}
+
+static void ggml_cpu_attn_timing_emit(const struct ggml_threadpool * tp) {
+    const struct ggml_cgraph * cgraph = tp->cgraph;
+    const int n_threads = tp->attn_timing_n_threads;
+
+    for (int node_n = 0; node_n < tp->attn_timing_n_nodes; ++node_n) {
+        const struct ggml_tensor * node = cgraph->nodes[node_n];
+        if (node->op != GGML_OP_FLASH_ATTN_EXT) {
+            continue;
+        }
+
+        uint64_t start_ns = UINT64_MAX;
+        uint64_t end_ns = 0;
+        int valid_workers = 0;
+        bool path_mismatch = false;
+        enum ggml_cpu_attn_kernel_path path = GGML_CPU_ATTN_KERNEL_NONE;
+
+        for (int ith = 0; ith < n_threads; ++ith) {
+            const struct ggml_cpu_attn_timing_worker * worker = &tp->attn_timing_workers[(size_t) node_n * n_threads + ith];
+            const bool worker_valid = worker->attempted && worker->start_ns != 0 && worker->end_ns >= worker->start_ns && worker->path != GGML_CPU_ATTN_KERNEL_NONE;
+            if (!worker_valid) {
+                continue;
+            }
+            start_ns = MIN(start_ns, worker->start_ns);
+            end_ns = MAX(end_ns, worker->end_ns);
+            if (path == GGML_CPU_ATTN_KERNEL_NONE) {
+                path = worker->path;
+            } else if (path != worker->path) {
+                path_mismatch = true;
+            }
+            ++valid_workers;
+        }
+
+        const struct ggml_cpu_attn_diag_link * link = &tp->attn_timing_links[node_n];
+        const bool linked = link->graph_generation != 0 && link->execution_id != 0 && link->layer >= 0;
+        const bool valid = valid_workers == n_threads && !path_mismatch && start_ns != UINT64_MAX && end_ns >= start_ns;
+        const uint64_t output_start_ns = start_ns == UINT64_MAX ? 0 : start_ns;
+        const uint64_t elapsed_ns = valid ? end_ns - start_ns : 0;
+        const char * path_name = path_mismatch ? "MISMATCH" : ggml_cpu_attn_timing_path_name(path);
+        const char * record_scope = !linked ? "UNLINKED" : link->request_id < 0 ? "PROBE" : "REQUEST";
+
+        flockfile(stderr);
+        fprintf(stderr, "ATTN_TIMING event=CPU_FLASH valid=%d linked=%d record_scope=%s call_id=%" PRIu64 " ubatch_idx=%" PRId64 " graph_generation=%" PRIu64 " execution_id=%" PRIu64 " node=%p node_index=%d layer=%d kernel_path=%s start_ns=%" PRIu64 " end_ns=%" PRIu64 " elapsed_ns=%" PRIu64 " clock_domain=monotonic_raw workers=%d valid_workers=%d missing_workers=%d path_mismatch=%d request_id=%" PRId64 " task_id=%" PRId64 " slot_id=%" PRId64 " stage=%s input_kind=%s\n",
+            (int) valid, (int) linked, record_scope, link->call_id, link->ubatch_idx, link->graph_generation, link->execution_id,
+            (const void *) node, node_n, link->layer, path_name, output_start_ns, end_ns, elapsed_ns,
+            n_threads, valid_workers, n_threads - valid_workers, (int) path_mismatch, link->request_id, link->task_id, link->slot_id,
+            link->stage ? link->stage : "UNKNOWN", link->input_kind ? link->input_kind : "UNKNOWN");
+
+        if (ggml_cpu_attn_timing_raw) {
+            for (int ith = 0; ith < n_threads; ++ith) {
+                const struct ggml_cpu_attn_timing_worker * worker = &tp->attn_timing_workers[(size_t) node_n * n_threads + ith];
+                const bool worker_valid = worker->attempted && worker->start_ns != 0 && worker->end_ns >= worker->start_ns && worker->path != GGML_CPU_ATTN_KERNEL_NONE;
+                const uint64_t worker_elapsed_ns = worker_valid ? worker->end_ns - worker->start_ns : 0;
+                fprintf(stderr, "ATTN_TIMING event=CPU_FLASH_WORKER valid=%d linked=%d record_scope=%s call_id=%" PRIu64 " ubatch_idx=%" PRId64 " graph_generation=%" PRIu64 " execution_id=%" PRIu64 " node=%p node_index=%d layer=%d ith=%d kernel_path=%s start_ns=%" PRIu64 " end_ns=%" PRIu64 " elapsed_ns=%" PRIu64 " clock_domain=monotonic_raw request_id=%" PRId64 " task_id=%" PRId64 " slot_id=%" PRId64 " stage=%s input_kind=%s\n",
+                    (int) worker_valid, (int) linked, record_scope, link->call_id, link->ubatch_idx, link->graph_generation, link->execution_id,
+                    (const void *) node, node_n, link->layer, ith, ggml_cpu_attn_timing_path_name(worker->path),
+                    worker->start_ns, worker->end_ns, worker_elapsed_ns, link->request_id, link->task_id, link->slot_id,
+                    link->stage ? link->stage : "UNKNOWN", link->input_kind ? link->input_kind : "UNKNOWN");
+            }
+        }
+        funlockfile(stderr);
+    }
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3118,6 +3270,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.wdata      =*/ cplan->work_data,
         /*.threadpool =*/ tp,
         /*.use_ref    =*/ cplan->use_ref,
+        /*.attn_timing_path =*/ NULL,
     };
 
 #ifdef GGML_USE_OPENMP
@@ -3144,7 +3297,18 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
+            struct ggml_cpu_attn_timing_worker * timing_worker = NULL;
+            if (tp->attn_timing_active && node->op == GGML_OP_FLASH_ATTN_EXT) {
+                timing_worker = &tp->attn_timing_workers[(size_t) node_n * params.nth + state->ith];
+                timing_worker->attempted = true;
+                params.attn_timing_path = &timing_worker->path;
+                timing_worker->start_ns = ggml_cpu_attn_timing_now_ns();
+            }
             ggml_compute_forward(&params, node);
+            if (timing_worker) {
+                timing_worker->end_ns = ggml_cpu_attn_timing_now_ns();
+                params.attn_timing_path = NULL;
+            }
         }
 
         if (state->ith == 0 && cplan->abort_callback &&
@@ -3165,6 +3329,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 #endif
 
     ggml_barrier(state->threadpool);
+
+    if (state->ith == 0 && tp->attn_timing_active) {
+        ggml_cpu_attn_timing_emit(tp);
+    }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
     ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(state->ith);
@@ -3332,6 +3500,13 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->n_threads        = tpp->n_threads;
         threadpool->poll             = tpp->poll;
         threadpool->prio             = tpp->prio;
+        threadpool->attn_timing_workers = NULL;
+        threadpool->attn_timing_links = NULL;
+        threadpool->attn_timing_worker_capacity = 0;
+        threadpool->attn_timing_link_capacity = 0;
+        threadpool->attn_timing_n_nodes = 0;
+        threadpool->attn_timing_n_threads = 0;
+        threadpool->attn_timing_active = false;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3416,6 +3591,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#ifndef GGML_USE_OPENMP
+    if (n_threads > threadpool->n_threads) {
+        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
+        n_threads = threadpool->n_threads;
+    }
+#endif
+
+    ggml_cpu_attn_timing_prepare(threadpool, cgraph, n_threads);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -3424,6 +3608,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             {
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
+                threadpool->attn_timing_n_threads = n_threads;
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
@@ -3441,11 +3626,6 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         ggml_graph_compute_thread(&threadpool->workers[0]);
     }
 #else
-    if (n_threads > threadpool->n_threads) {
-        GGML_LOG_WARN("cplan requested more threads (%d) than available (%d)\n", n_threads, threadpool->n_threads);
-        n_threads = threadpool->n_threads;
-    }
-
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
@@ -3927,6 +4107,16 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("GGML_CPU_DISABLE_FUSION");
             ggml_cpu_disable_fusion = (env != NULL && atoi(env) == 1);
+        }
+
+        {
+            const char * env = getenv("LLAMA_CPU_ATTN_TIMING");
+            ggml_cpu_attn_timing = env != NULL && env[0] == '1' && env[1] == '\0';
+        }
+
+        {
+            const char * env = getenv("LLAMA_CPU_ATTN_TIMING_RAW");
+            ggml_cpu_attn_timing_raw = ggml_cpu_attn_timing && env != NULL && env[0] == '1' && env[1] == '\0';
         }
 
         is_first_call = false;

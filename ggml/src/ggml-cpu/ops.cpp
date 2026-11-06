@@ -26,6 +26,18 @@ static bool ggml_cpu_attn_diagnostic_enabled() {
     return enabled;
 }
 
+static bool ggml_cpu_attn_timing_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_CPU_ATTN_TIMING");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool ggml_cpu_attn_linking_enabled() {
+    return ggml_cpu_attn_diagnostic_enabled() || ggml_cpu_attn_timing_enabled();
+}
+
 static bool ggml_cpu_kvb_diagnostic_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_KVB_DIAGNOSTIC");
@@ -56,7 +68,7 @@ static std::mutex ggml_cpu_attn_diag_mutex;
 static std::unordered_map<const ggml_tensor *, ggml_cpu_attn_diag_entry> ggml_cpu_attn_diag_nodes;
 
 extern "C" void ggml_cpu_attn_diag_register_node(const ggml_tensor * node, uint64_t graph_generation, int32_t layer) {
-    if (!ggml_cpu_attn_diagnostic_enabled() || !graph_generation) {
+    if (!ggml_cpu_attn_linking_enabled() || !graph_generation) {
         return;
     }
     std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
@@ -64,7 +76,7 @@ extern "C" void ggml_cpu_attn_diag_register_node(const ggml_tensor * node, uint6
 }
 
 extern "C" int ggml_cpu_attn_diag_bind_graph(const ggml_cgraph * graph, ggml_cpu_attn_diag_link link) {
-    if (!ggml_cpu_attn_diagnostic_enabled()) {
+    if (!ggml_cpu_attn_linking_enabled()) {
         return 0;
     }
     std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
@@ -103,6 +115,14 @@ static ggml_cpu_attn_diag_link ggml_cpu_attn_diag_lookup(const ggml_tensor * nod
     unlinked.ubatch_idx = -1;
     unlinked.layer = -1;
     return unlinked;
+}
+
+extern "C" int ggml_cpu_attn_diag_get_link(const ggml_tensor * node, ggml_cpu_attn_diag_link * link) {
+    if (!link) {
+        return 0;
+    }
+    *link = ggml_cpu_attn_diag_lookup(node);
+    return link->execution_id != 0;
 }
 
 static void ggml_cpu_attn_diag_print_link(const ggml_cpu_attn_diag_link & link) {
@@ -9415,6 +9435,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
+        if (params->attn_timing_path) {
+            *params->attn_timing_path = GGML_CPU_ATTN_KERNEL_SPLIT_KV;
+        }
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
 
         if (ith == 0 && ggml_cpu_attn_diagnostic_enabled()) {
@@ -9501,6 +9524,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+        if (params->attn_timing_path) {
+            *params->attn_timing_path = use_tiled ? GGML_CPU_ATTN_KERNEL_TILED : GGML_CPU_ATTN_KERNEL_ONE_CHUNK;
+        }
         if (ith == 0 && ggml_cpu_attn_diagnostic_enabled()) {
             flockfile(stderr);
             std::fprintf(stderr, "ATTN_DIAG event=CPU_FLASH node=%p path=%s ith=0 nth=%d use_ref=%d q_type=%s k_type=%s v_type=%s neq1=%lld neq2=%lld neq3=%lld nek1=%lld DK=%lld DV=%lld mask=%d q_tile=%lld kv_tile=%d rows=%lld row_chunks=%lld row_chunk_size=%lld simd_f32_epr=%lld",

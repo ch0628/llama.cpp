@@ -12,6 +12,18 @@ inline bool llama_attn_diagnostic_enabled() {
     return enabled;
 }
 
+inline bool llama_cpu_attn_timing_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_CPU_ATTN_TIMING");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+inline bool llama_attn_linking_enabled() {
+    return llama_attn_diagnostic_enabled() || llama_cpu_attn_timing_enabled();
+}
+
 inline bool llama_kvb_diagnostic_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_KVB_DIAGNOSTIC");

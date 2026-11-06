@@ -522,7 +522,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
-    if (llama_attn_diagnostic_enabled()) {
+    if (llama_attn_linking_enabled()) {
         ggml_cpu_attn_diag_clear_generation(attn_graph_generation);
     }
 
@@ -1423,7 +1423,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
-        if (llama_attn_diagnostic_enabled()) {
+        if (llama_attn_linking_enabled()) {
             ggml_cpu_attn_diag_clear_generation(attn_graph_generation);
             attn_graph_generation = ++attn_diag_next_id;
         }
@@ -1435,7 +1435,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         phase_event("llama", "GRAPH_BUILD_START", phase_kind::POINT);
-        if (llama_attn_diagnostic_enabled()) {
+        if (llama_attn_linking_enabled()) {
             phase_active_graph_generation() = attn_graph_generation;
         }
         try {
@@ -1472,7 +1472,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         phase_event("llama", "GRAPH_PREP_END", phase_kind::POINT, 0, graph_fields);
     }
 
-    if (llama_attn_diagnostic_enabled()) {
+    if (llama_attn_linking_enabled()) {
         const auto & call = phase_active_call();
         ggml_cpu_attn_diag_link link = {};
         link.graph_generation = attn_graph_generation;
@@ -1485,13 +1485,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         link.stage = call.stage;
         link.input_kind = call.input_kind;
         const int bound_nodes = ggml_cpu_attn_diag_bind_graph(res->get_gf(), link);
-        flockfile(stderr);
-        std::fprintf(stderr, "ATTN_DIAG event=UBATCH graph=%p graph_generation=%llu execution_id=%llu bound_nodes=%d request_id=%lld task_id=%lld slot_id=%lld call_id=%llu ubatch_idx=%lld stage=%s input_kind=%s tokens=%u seqs=%u reused=%d\n",
-            static_cast<void *>(res->get_gf()), (unsigned long long) link.graph_generation, (unsigned long long) link.execution_id,
-            bound_nodes, (long long) link.request_id, (long long) link.task_id, (long long) link.slot_id,
-            (unsigned long long) link.call_id, (long long) link.ubatch_idx, link.stage, link.input_kind,
-            ubatch.n_tokens, ubatch.n_seqs_unq, int(graph_reused));
-        funlockfile(stderr);
+        if (llama_attn_diagnostic_enabled()) {
+            flockfile(stderr);
+            std::fprintf(stderr, "ATTN_DIAG event=UBATCH graph=%p graph_generation=%llu execution_id=%llu bound_nodes=%d request_id=%lld task_id=%lld slot_id=%lld call_id=%llu ubatch_idx=%lld stage=%s input_kind=%s tokens=%u seqs=%u reused=%d\n",
+                static_cast<void *>(res->get_gf()), (unsigned long long) link.graph_generation, (unsigned long long) link.execution_id,
+                bound_nodes, (long long) link.request_id, (long long) link.task_id, (long long) link.slot_id,
+                (unsigned long long) link.call_id, (long long) link.ubatch_idx, link.stage, link.input_kind,
+                ubatch.n_tokens, ubatch.n_seqs_unq, int(graph_reused));
+            funlockfile(stderr);
+        }
     }
 
     // set the input data for the input tensors
@@ -1939,7 +1941,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     do {
         const auto & ubatch = mctx->get_ubatch();
-        if (phase_events_path() || llama_attn_diagnostic_enabled()) {
+        if (phase_events_path() || llama_attn_linking_enabled()) {
             phase_active_call().ubatch_idx = phase_ubatch_idx;
         }
         phase_ubatch_idx++;
