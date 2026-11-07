@@ -1,0 +1,483 @@
+]633;E;git --no-pager diff;27a99876-30c4-41e6-a270-30ba0af20106]633;Cdiff --git a/tools/mtmd/clip.cpp b/tools/mtmd/clip.cpp
+index cd6421def..97f6bd615 100644
+--- a/tools/mtmd/clip.cpp
++++ b/tools/mtmd/clip.cpp
+@@ -2,6 +2,7 @@
+ #include "clip-impl.h"
+ #include "clip-model.h"
+ #include "clip-graph.h"
++#include "phase-events.h"
+ #include "models/models.h"
+ 
+ #include "ggml.h"
+@@ -4425,7 +4426,9 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+ 
+     // if buffers are not allocated, we need to do a warmup run to allocate them
+     if (!ctx->is_allocated) {
++        const auto warmup_span = phase_event("vision", "VISION_INTERNAL_WARMUP_START", phase_kind::START);
+         clip_model_loader::warmup(*ctx, *params->imgs);
++        phase_event("vision", "VISION_INTERNAL_WARMUP_END", phase_kind::END, warmup_span);
+     }
+ 
+     if (params->seed != ctx->rng_seed) {
+@@ -4434,9 +4437,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+     }
+ 
+     // build the inference graph
++    const auto graph_span = phase_event("vision", "VISION_GRAPH_PREP_START", phase_kind::START);
+     ggml_backend_sched_reset(ctx->sched.get());
+     ggml_cgraph * gf = clip_get_graph_builder(ctx, imgs, params)->build();
+     ggml_backend_sched_alloc_graph(ctx->sched.get(), gf);
++    phase_event("vision", "VISION_GRAPH_PREP_END", phase_kind::END, graph_span);
++    const auto input_span = phase_event("vision", "VISION_INPUT_SETUP_START", phase_kind::START);
+ 
+     // set inputs
+     const auto & model   = ctx->model;
+@@ -5746,7 +5752,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+         }
+     }
+ 
++    phase_event("vision", "VISION_INPUT_SETUP_END", phase_kind::END, input_span);
++    const auto compute_span = phase_event("vision", "VISION_COMPUTE_START", phase_kind::START);
+     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
++    phase_fields compute_fields;
++    compute_fields.status = status;
++    phase_event("vision", "VISION_COMPUTE_END", phase_kind::END, compute_span, compute_fields);
+     if (status != GGML_STATUS_SUCCESS) {
+         LOG_ERR("%s: ggml_backend_sched_graph_compute failed with error %d\n", __func__, status);
+         return false;
+@@ -5775,7 +5786,12 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
+                 LOG_ERR("%s: output buffer has %zu elements but expected %zu\n", __func__, out_batch_embd.size(), (size_t)ggml_nelements(embeddings));
+                 GGML_ABORT("Output buffer size mismatch");
+             }
++            const auto copy_span = phase_event("vision", "VISION_EMBED_COPY_START", phase_kind::START);
+             ggml_backend_tensor_get(embeddings, out_batch_embd.data(), 0, ggml_nbytes(embeddings));
++            phase_event("vision", "VISION_EMBED_COPY_END", phase_kind::END, copy_span);
++            phase_fields ready_fields;
++            ready_fields.token_count = n_tokens_out;
++            phase_event("vision", "VISUAL_EMBEDDING_READY", phase_kind::POINT, 0, ready_fields);
+         } else {
+             LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
+         }
+diff --git a/tools/mtmd/mtmd-helper.cpp b/tools/mtmd/mtmd-helper.cpp
+index dc2ab414e..e1aaa1236 100644
+--- a/tools/mtmd/mtmd-helper.cpp
++++ b/tools/mtmd/mtmd-helper.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#include "phase-events.h"
+ #include "mtmd-helper-common.h"
+ #include "llama.h"
+ 
+@@ -174,7 +175,20 @@ int32_t mtmd_helper_decode_image_chunk(
+         LOG_INF("decoding %s batch %d/%d, n_tokens_batch = %d\n", name, i_batch+1, n_img_batches, n_tokens_batch);
+ 
+         int64_t t1 = ggml_time_ms();
++        phase_fields prefill_fields;
++        prefill_fields.sub_idx = i_batch;
++        prefill_fields.token_count = n_tokens_batch;
++        const auto prefill_span = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? phase_event("mtmd", "VISUAL_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields) : 0;
+         int32_t ret = llama_decode(lctx, batch_embd_view);
++        if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
++            prefill_fields.status = ret;
++            phase_event("mtmd", "VISUAL_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, prefill_span, prefill_fields);
++            if (ret == 0 && phase_sync_validate()) {
++                const auto sync_span = phase_event("mtmd", "LLM_SYNC_START", phase_kind::START, 0, prefill_fields);
++                llama_synchronize(lctx);
++                phase_event("mtmd", "LLM_SYNC_END", phase_kind::END, sync_span, prefill_fields);
++            }
++        }
+         if (ret != 0) {
+             LOG_ERR("failed to decode %s\n", name);
+             return ret;
+@@ -405,13 +419,21 @@ mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(const mtmd_context *
+     // otherwise, we assume it's an image
+     if (!result) {
+         int nx, ny, nc;
++        const auto image_decode_span = phase_event("mtmd", "IMAGE_DECODE_START", phase_kind::START);
+         auto * data = stbi_load_from_memory(buf, len, &nx, &ny, &nc, 3);
+         if (data) {
+             result = mtmd_bitmap_init(nx, ny, placeholder ? nullptr : data);
+             mtmd_bitmap_set_id(result, id.empty() ? nullptr : id.c_str());
+             stbi_image_free(data);
++            phase_fields fields;
++            fields.image_w = nx;
++            fields.image_h = ny;
++            phase_event("mtmd", "IMAGE_DECODE_END", phase_kind::END, image_decode_span, fields);
+             return {result, nullptr};
+         }
++        phase_fields fields;
++        fields.status = -2;
++        phase_event("mtmd", "IMAGE_DECODE_END", phase_kind::END, image_decode_span, fields);
+         // otherwise, fallthrough to video decoding (if supported)
+     }
+ 
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index 00ecadcf4..e49b89ee3 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -2,6 +2,7 @@
+ #include "clip-impl.h"
+ #include "mtmd.h"
+ #include "mtmd-internal.h"
++#include "phase-events.h"
+ #include "mtmd-audio.h"
+ #include "mtmd-image.h"
+ #include "debug/mtmd-debug.h"
+@@ -26,6 +27,11 @@
+ #include <type_traits>
+ #include <vector>
+ 
++phase_log & phase_logger() {
++    static phase_log log;
++    return log;
++}
++
+ // remember to bump this if the serialization format changes
+ #define MTMD_SERIALIZATION_VERSION 2
+ 
+@@ -1375,7 +1381,12 @@ struct mtmd_tokenizer {
+                 img_u8.cpy_buf(bmp->get_ro_buf());
+ 
+                 // preprocess image
++                phase_fields preproc_fields;
++                preproc_fields.image_w = bmp->nx;
++                preproc_fields.image_h = bmp->ny;
++                const auto preproc_span = phase_event("mtmd", "VISION_PREPROCESS_START", phase_kind::START, 0, preproc_fields);
+                 mtmd_image_preproc_out tmp_preproc_out = ctx->image_preproc->preprocess(img_u8);
++                phase_event("mtmd", "VISION_PREPROCESS_END", phase_kind::END, preproc_span, preproc_fields);
+ 
+                 // move entries and grid dimensions to the "global" preproc_out
+                 for (auto & entry : tmp_preproc_out.entries) {
+@@ -1715,6 +1726,7 @@ struct mtmd_tokenizer {
+         if (vocab == nullptr) {
+             throw std::runtime_error("llama_vocab is not provided");
+         }
++        const auto tokenize_span = phase_event("mtmd", "TEXT_TOKENIZE_START", phase_kind::START);
+         // upper limit for the number of tokens
+         int n_tokens = text.length() + 2 * add_special;
+         std::vector<llama_token> result(n_tokens);
+@@ -1729,6 +1741,9 @@ struct mtmd_tokenizer {
+         } else {
+             result.resize(n_tokens);
+         }
++        phase_fields tokenize_fields;
++        tokenize_fields.token_count = result.size();
++        phase_event("mtmd", "TEXT_TOKENIZE_END", phase_kind::END, tokenize_span, tokenize_fields);
+         return result;
+     }
+ };
+diff --git a/tools/server/server-common.cpp b/tools/server/server-common.cpp
+index 2ac98b6fd..6f5c77999 100644
+--- a/tools/server/server-common.cpp
++++ b/tools/server/server-common.cpp
+@@ -4,6 +4,7 @@
+ #include "llama.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#include "phase-events.h"
+ #include "chat.h"
+ #include "base64.hpp"
+ 
+@@ -1068,6 +1069,8 @@ static void handle_media(
+         GGML_ASSERT(media_path.back() == DIRECTORY_SEPARATOR);
+     }
+ 
++    const auto image_input_span = phase_event("server", "IMAGE_INPUT_START", phase_kind::START);
++
+     if (string_starts_with(url, "http")) {
+         // download remote image
+         // TODO @ngxson : maybe make these params configurable
+@@ -1128,6 +1131,7 @@ static void handle_media(
+         }
+         out_files.push_back(decoded_data);
+     }
++    phase_event("server", "IMAGE_INPUT_END", phase_kind::END, image_input_span);
+ }
+ 
+ // used by /chat/completions endpoint
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index fe068d3e9..b18296699 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -16,6 +16,7 @@
+ #include "speculative.h"
+ #include "mtmd.h"
+ #include "mtmd-helper.h"
++#include "phase-events.h"
+ 
+ #include <algorithm>
+ #include <cstddef>
+@@ -1822,6 +1823,12 @@ private:
+         slot.state = slot.task->is_child()
+             ? SLOT_STATE_WAIT_OTHER // wait for the parent to process prompt
+             : SLOT_STATE_STARTED;
++        if (slot.state == SLOT_STATE_STARTED) {
++            phase_fields fields;
++            fields.task_id = slot.task->id;
++            fields.slot_id = slot.id;
++            phase_event("server", "SERVER_INFERENCE_START", phase_kind::POINT, 0, fields);
++        }
+ 
+         // reset server kill-switch counter
+         n_empty_consecutive = 0;
+@@ -1958,6 +1965,13 @@ private:
+ 
+         SLT_DBG(slot, "n_gen = %d, n_remaining = %d, next token: %5d '%s'\n", (int) slot.stats.n_gen, slot.n_remaining(), result.tok, token_str.c_str());
+ 
++        if (!slot.has_next_token) {
++            phase_fields fields;
++            fields.task_id = slot.task->id;
++            fields.slot_id = slot.id;
++            fields.token_count = slot.stats.n_gen;
++            phase_event("server", "DECODE_END", phase_kind::POINT, 0, fields);
++        }
+         return slot.has_next_token; // continue
+     }
+ 
+@@ -2087,6 +2101,10 @@ private:
+     }
+ 
+     void send_final_response(server_slot & slot) {
++        phase_fields response_fields;
++        response_fields.task_id = slot.task->id;
++        response_fields.slot_id = slot.id;
++        const auto response_span = phase_event("server", "SERVER_FINAL_RESPONSE_START", phase_kind::START, 0, response_fields);
+         auto res = std::make_unique<server_task_result_cmpl_final>();
+ 
+         res->id      = slot.task->id;
+@@ -2147,6 +2165,10 @@ private:
+         res->generation_params = slot.task->params; // copy the parameters
+ 
+         queue_results.send(std::move(res));
++        phase_event("server", "SERVER_FINAL_RESPONSE_RETURN", phase_kind::END, response_span, response_fields);
++        if (!phase_flush()) {
++            SRV_WRN("%s", "failed to write phase events\n");
++        }
+     }
+ 
+     void send_embedding(const server_slot & slot, const llama_batch & batch) {
+@@ -3675,11 +3697,40 @@ private:
+             has_output |= batch.tokens[i].output;
+         }
+ 
++        bool is_prompt = batch.tokens[off].is_prompt;
++        bool one_phase = true;
++        const int32_t phase_slot_id = batch.tokens[off].id_slot;
++        for (int i = off + 1; i < off + batch_view.n_tokens; ++i) {
++            one_phase &= batch.tokens[i].is_prompt == is_prompt && batch.tokens[i].id_slot == phase_slot_id;
++        }
++        phase_fields decode_fields;
++        decode_fields.slot_id = phase_slot_id;
++        if (batch.slot_batched && batch.slot_batched->id == phase_slot_id && batch.slot_batched->task) {
++            decode_fields.task_id = batch.slot_batched->task->id;
++        }
++        decode_fields.token_count = batch_view.n_tokens;
++        decode_fields.pos_start = batch.tokens[off].pos;
++        decode_fields.pos_end = batch.tokens[off + batch_view.n_tokens - 1].pos;
++        if (!one_phase) {
++            decode_fields.note = "mixed_prompt_or_slot";
++            phase_event("server", "MIXED_BATCH_SKIPPED", phase_kind::POINT, 0, decode_fields);
++        }
++
+         // yield to the queue, so we can still handle metrics tasks while decoding
+         // note: the sync is done here too, so that the wait is also covered by the yield
+         int ret = 0;
+         queue_tasks.yield_to_queue([&]() {
++            const auto decode_span = one_phase ? phase_event("server", is_prompt ? "TEXT_PREFILL_CALL_START" : "GENERATED_TOKEN_EVAL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
+             ret = llama_decode(ctx_tgt, batch_view);
++            if (one_phase) {
++                decode_fields.status = ret;
++                phase_event("server", is_prompt ? "TEXT_PREFILL_CALL_RETURN" : "GENERATED_TOKEN_EVAL_CALL_RETURN", phase_kind::CALL_RETURN, decode_span, decode_fields);
++            }
++            if (ret == 0 && phase_sync_validate()) {
++                const auto sync_span = phase_event("server", "LLM_SYNC_START", phase_kind::START, 0, decode_fields);
++                llama_synchronize(ctx_tgt);
++                phase_event("server", "LLM_SYNC_END", phase_kind::END, sync_span, decode_fields);
++            }
+             if (ret == 0 && has_output) {
+                 llama_synchronize(ctx_tgt);
+             }
+@@ -3835,6 +3886,10 @@ private:
+ 
+                 // prompt evaluated for next-token prediction
+                 slot.state = SLOT_STATE_GENERATING;
++                phase_fields fields;
++                fields.task_id = slot.task->id;
++                fields.slot_id = slot.id;
++                phase_event("server", "PREFILL_SUBMISSION_COMPLETE", phase_kind::POINT, 0, fields);
+ 
+                 if (slot.can_speculate()) {
+                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());
+@@ -3853,7 +3908,19 @@ private:
+             llama_token id;
+             {
+                 scoped_timer timer(t_sampl, n_sampl);
++                if (slot.stats.n_gen == 0) {
++                    phase_fields fields;
++                    fields.task_id = slot.task->id;
++                    fields.slot_id = slot.id;
++                    phase_event("server", "DECODE_START", phase_kind::POINT, 0, fields);
++                }
+                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
++                phase_fields fields;
++                fields.task_id = slot.task->id;
++                fields.slot_id = slot.id;
++                fields.item_idx = slot.stats.n_gen;
++                fields.token_id = id;
++                phase_event("server", "TOKEN_READY", phase_kind::POINT, 0, fields);
+             }
+ 
+             slot.i_batch = -1;
+diff --git a/tools/mtmd/phase-events.h b/tools/mtmd/phase-events.h
+new file mode 100644
+index 000000000..3f23baefd
+--- /dev/null
++++ b/tools/mtmd/phase-events.h
+@@ -0,0 +1,144 @@
++#pragma once
++
++#include <cstdint>
++#include <cstdlib>
++#include <fstream>
++#include <mutex>
++#include <vector>
++#include <ctime>
++
++enum class phase_kind { START, END, CALL_START, CALL_RETURN, POINT };
++
++struct phase_fields {
++    int64_t task_id     = -1;
++    int64_t slot_id     = -1;
++    int64_t item_idx    = -1;
++    int64_t sub_idx     = -1;
++    int64_t token_count = -1;
++    int64_t token_id    = -1;
++    int64_t pos_start   = -1;
++    int64_t pos_end     = -1;
++    int64_t image_w     = -1;
++    int64_t image_h     = -1;
++    int64_t status      = -1;
++    const char * note   = "";
++};
++
++inline uint64_t phase_now_ns() {
++#ifdef CLOCK_MONOTONIC_RAW
++    timespec ts;
++    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
++    return uint64_t(ts.tv_sec) * 1000000000ULL + uint64_t(ts.tv_nsec);
++#else
++    return 0;
++#endif
++}
++
++struct phase_record {
++    uint64_t run_id;
++    uint64_t seq;
++    uint64_t ts_ns;
++    const char * component;
++    const char * name;
++    phase_kind kind;
++    uint64_t span_id;
++    phase_fields fields;
++};
++
++struct phase_log {
++    std::mutex mutex;
++    std::vector<phase_record> records;
++    uint64_t run_id = 0;
++    uint64_t next_seq = 1;
++    uint64_t next_span = 1;
++};
++
++phase_log & phase_logger();
++
++inline const char * phase_events_path() {
++#ifdef CLOCK_MONOTONIC_RAW
++    static const char * path = std::getenv("LLAMA_PHASE_EVENTS_PATH");
++    return path && path[0] ? path : nullptr;
++#else
++    return nullptr;
++#endif
++}
++
++inline bool phase_sync_validate() {
++    static const char * value = std::getenv("LLAMA_PHASE_SYNC_VALIDATE");
++    return phase_events_path() && value && value[0] == '1' && value[1] == '\0';
++}
++
++inline uint64_t phase_event(const char * component, const char * name, phase_kind kind, uint64_t span_id = 0, phase_fields fields = {}) {
++    if (!phase_events_path()) {
++        return 0;
++    }
++    const uint64_t ts_ns = phase_now_ns();
++    auto & log = phase_logger();
++    std::lock_guard<std::mutex> lock(log.mutex);
++    if (!log.run_id) {
++        log.run_id = ts_ns;
++    }
++    if (kind == phase_kind::START || kind == phase_kind::CALL_START) {
++        span_id = log.next_span++;
++    }
++    log.records.push_back({ log.run_id, log.next_seq++, ts_ns, component, name, kind, span_id, fields });
++    return span_id;
++}
++
++inline bool phase_flush() {
++    if (!phase_events_path()) {
++        return true;
++    }
++    auto & log = phase_logger();
++    std::lock_guard<std::mutex> lock(log.mutex);
++    if (log.records.empty()) {
++        return true;
++    }
++    std::ofstream out(phase_events_path(), std::ios::app);
++    if (!out) {
++        return false;
++    }
++    if (out.tellp() == 0) {
++        out << "schema_version,run_id,seq,ts_ns,clock_domain,component,event_name,event_kind,span_id,task_id,slot_id,item_idx,sub_idx,token_count,token_id,pos_start,pos_end,image_w,image_h,status,note\n";
++    }
++    auto optional = [&](int64_t value) {
++        if (value != -1) {
++            out << value;
++        }
++    };
++    for (const auto & event : log.records) {
++        out << "1," << event.run_id << ',' << event.seq << ',' << event.ts_ns << ",pi_monotonic_raw," << event.component << ',' << event.name << ',';
++        const char * kind_name = nullptr;
++        switch (event.kind) {
++            case phase_kind::START:       kind_name = "START";       break;
++            case phase_kind::END:         kind_name = "END";         break;
++            case phase_kind::CALL_START:  kind_name = "CALL_START";  break;
++            case phase_kind::CALL_RETURN: kind_name = "CALL_RETURN"; break;
++            case phase_kind::POINT:       kind_name = "POINT";       break;
++        }
++        out << kind_name << ',';
++        if (event.span_id) {
++            out << event.span_id;
++        }
++        out << ','; optional(event.fields.task_id);
++        out << ','; optional(event.fields.slot_id);
++        out << ','; optional(event.fields.item_idx);
++        out << ','; optional(event.fields.sub_idx);
++        out << ','; optional(event.fields.token_count);
++        out << ','; optional(event.fields.token_id);
++        out << ','; optional(event.fields.pos_start);
++        out << ','; optional(event.fields.pos_end);
++        out << ','; optional(event.fields.image_w);
++        out << ','; optional(event.fields.image_h);
++        out << ','; optional(event.fields.status);
++        out << ',' << event.fields.note << '\n';
++    }
++    out.close();
++    if (!out) {
++        return false;
++    }
++    log.records.clear();
++    log.run_id = 0;
++    return true;
++}
