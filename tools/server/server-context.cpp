@@ -1833,6 +1833,7 @@ private:
             fields.request_id = fields.task_id;
             fields.seq_id = slot.id;
             phase_kv_snapshot(ctx_tgt, "KV_PRE_REQUEST", fields);
+            kv_residency_snapshot(ctx_tgt, "KV_PRE_REQUEST", "REQUEST_START", fields);
         }
 
         // reset server kill-switch counter
@@ -1980,6 +1981,7 @@ private:
             fields.seq_id = slot.id;
             fields.call_id = phase_last_prefill_call(fields.request_id);
             phase_kv_snapshot(ctx_tgt, "KV_DECODE_END", fields);
+            kv_residency_snapshot(ctx_tgt, "KV_DECODE_END", "DECODE_COMPLETE", fields);
         }
         return slot.has_next_token; // continue
     }
@@ -3979,6 +3981,7 @@ private:
                 fields.seq_id = slot.id;
                 fields.call_id = phase_last_prefill_call(fields.request_id);
                 phase_kv_snapshot(ctx_tgt, "KV_PREFILL_END", fields);
+                kv_residency_snapshot(ctx_tgt, "KV_PREFILL_END", "PREFILL_COMPLETE", fields);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

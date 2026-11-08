@@ -9,12 +9,63 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cerrno>
+#include <chrono>
 #include <cmath>
 #include <cstring>
+#include <fstream>
+#include <iomanip>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <new>
+#include <string>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+namespace {
+
+struct kv_residency_row {
+    size_t buffer_index = 0;
+    std::string backend;
+    uint64_t allocated_bytes = 0;
+    uintptr_t aligned_start = 0;
+    uintptr_t aligned_end = 0;
+    uint64_t scanned_pages = 0;
+    uint64_t resident_pages = 0;
+    uint64_t overlap_pages = 0;
+    uint64_t elapsed_ns = 0;
+    std::string status;
+    int error_no = 0;
+    bool has_range = false;
+    bool has_counts = false;
+};
+
+static std::string kv_residency_csv_field(const char * value) {
+    std::string result = "\"";
+    for (const char * p = value ? value : ""; *p; ++p) {
+        if (*p == '"') {
+            result += '"';
+        }
+        result += *p;
+    }
+    result += '"';
+    return result;
+}
+
+static uint64_t kv_residency_elapsed_ns(const std::chrono::steady_clock::time_point & start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - start).count();
+}
+
+} // namespace
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -1215,6 +1266,348 @@ void llama_kv_cache::fill_phase_snapshot(phase_fields & fields) const {
     fields.kv_k_logical_bytes = size_k_bytes();
     fields.kv_v_logical_bytes = size_v_bytes();
     fields.kv_backend_bytes = total_size();
+}
+
+void llama_kv_cache::log_residency_snapshot(
+        const char * event,
+        const char * stage,
+        const phase_fields & fields) const {
+    const char * enabled = std::getenv("LLAMA_KV_RESIDENCY_DIAGNOSTIC");
+    if (!enabled || enabled[0] != '1' || enabled[1] != '\0') {
+        return;
+    }
+
+    static std::mutex log_mutex;
+    static uint64_t next_snapshot_id = 1;
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    const uint64_t timestamp_ns = phase_now_ns();
+    const uint64_t snapshot_id = next_snapshot_id++;
+    std::vector<kv_residency_row> rows;
+    rows.reserve(ctxs_bufs.size());
+
+    uint64_t page_size = 0;
+#if defined(__linux__)
+    int page_size_errno = 0;
+    errno = 0;
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    page_size_errno = errno;
+    if (system_page_size > 0) {
+        page_size = static_cast<uint64_t>(system_page_size);
+    }
+#endif
+
+    uint64_t total_allocated_bytes = 0;
+    uint64_t total_scanned_pages = 0;
+    uint64_t total_resident_pages = 0;
+    uint64_t total_overlap_pages = 0;
+    bool total_allocated_overflow = false;
+    bool any_unmeasured = false;
+    bool any_scanned = false;
+
+#if defined(__linux__)
+    using page_range = std::pair<uintptr_t, uintptr_t>;
+    std::vector<page_range> covered_ranges;
+    auto add_covered_range = [&](uintptr_t start, uintptr_t end) {
+        std::vector<page_range> merged;
+        merged.reserve(covered_ranges.size() + 1);
+        bool inserted = false;
+        for (const auto & range : covered_ranges) {
+            if (range.second < start) {
+                merged.push_back(range);
+            } else if (end < range.first) {
+                if (!inserted) {
+                    merged.emplace_back(start, end);
+                    inserted = true;
+                }
+                merged.push_back(range);
+            } else {
+                start = std::min(start, range.first);
+                end = std::max(end, range.second);
+            }
+        }
+        if (!inserted) {
+            merged.emplace_back(start, end);
+        }
+        covered_ranges.swap(merged);
+    };
+#endif
+
+    for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
+        const auto buffer_start = std::chrono::steady_clock::now();
+        kv_residency_row row;
+        row.buffer_index = i;
+
+        ggml_backend_buffer_t buffer = ctxs_bufs[i].second.get();
+        if (!buffer) {
+            row.backend = "UNKNOWN";
+            row.status = "null_buffer";
+            any_unmeasured = true;
+            row.elapsed_ns = kv_residency_elapsed_ns(buffer_start);
+            rows.push_back(std::move(row));
+            continue;
+        }
+
+        row.backend = ggml_backend_buffer_name(buffer);
+        const size_t allocated_bytes = ggml_backend_buffer_get_size(buffer);
+        row.allocated_bytes = allocated_bytes;
+        if (allocated_bytes > std::numeric_limits<uint64_t>::max() - total_allocated_bytes) {
+            total_allocated_overflow = true;
+        } else {
+            total_allocated_bytes += allocated_bytes;
+        }
+
+        if (hparams.no_alloc) {
+            row.status = "no_alloc";
+            any_unmeasured = true;
+        } else if (allocated_bytes == 0) {
+            row.status = "zero_size";
+            any_unmeasured = true;
+#if !defined(__linux__)
+        } else {
+            row.status = "unsupported_platform";
+            any_unmeasured = true;
+#else
+        } else if (page_size == 0 || page_size > std::numeric_limits<uintptr_t>::max()) {
+            row.status = "page_size_unavailable";
+            row.error_no = page_size_errno;
+            any_unmeasured = true;
+        } else if (!ggml_backend_buffer_is_host(buffer)) {
+            row.status = "non_host_backend";
+            any_unmeasured = true;
+        } else {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+            ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+            const bool is_cpu_buffer = buft == ggml_backend_cpu_buffer_type() ||
+                (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!is_cpu_buffer) {
+                row.status = "non_cpu_backend";
+                any_unmeasured = true;
+            } else {
+                void * base = ggml_backend_buffer_get_base(buffer);
+                if (!base) {
+                    row.status = "null_base";
+                    any_unmeasured = true;
+                } else {
+                    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+                    const uintptr_t ps = static_cast<uintptr_t>(page_size);
+                    const uintptr_t max_addr = std::numeric_limits<uintptr_t>::max();
+
+                    if (allocated_bytes > max_addr - base_addr) {
+                        row.status = "address_overflow";
+                        any_unmeasured = true;
+                    } else {
+                        const uintptr_t allocation_end = base_addr + allocated_bytes;
+                        const uintptr_t aligned_start = (base_addr / ps) * ps;
+                        if (allocation_end > max_addr - (ps - 1)) {
+                            row.status = "alignment_overflow";
+                            any_unmeasured = true;
+                        } else {
+                            const uintptr_t aligned_end = ((allocation_end + ps - 1) / ps) * ps;
+                            row.aligned_start = aligned_start;
+                            row.aligned_end = aligned_end;
+                            row.has_range = true;
+
+                            if (aligned_end <= aligned_start) {
+                                row.status = "empty_aligned_range";
+                                any_unmeasured = true;
+                            } else {
+                                const uint64_t full_pages = (aligned_end - aligned_start) / ps;
+                                std::vector<page_range> uncovered;
+                                uintptr_t cursor = aligned_start;
+                                for (const auto & range : covered_ranges) {
+                                    if (range.second <= cursor) {
+                                        continue;
+                                    }
+                                    if (range.first >= aligned_end) {
+                                        break;
+                                    }
+                                    if (range.first > cursor) {
+                                        uncovered.emplace_back(cursor, std::min(range.first, aligned_end));
+                                    }
+                                    cursor = std::max(cursor, range.second);
+                                    if (cursor >= aligned_end) {
+                                        break;
+                                    }
+                                }
+                                if (cursor < aligned_end) {
+                                    uncovered.emplace_back(cursor, aligned_end);
+                                }
+
+                                uint64_t uncovered_pages = 0;
+                                for (const auto & range : uncovered) {
+                                    uncovered_pages += (range.second - range.first) / ps;
+                                }
+                                row.overlap_pages = full_pages - uncovered_pages;
+                                total_overlap_pages += row.overlap_pages;
+
+                                constexpr size_t mincore_chunk_pages = 64 * 1024;
+                                std::vector<unsigned char> residency;
+                                try {
+                                    residency.resize(static_cast<size_t>(std::min<uint64_t>(
+                                            uncovered_pages, mincore_chunk_pages)));
+                                } catch (const std::bad_alloc &) {
+                                    row.status = "residency_vector_allocation_failed";
+                                    row.error_no = ENOMEM;
+                                    any_unmeasured = true;
+                                }
+
+                                bool scan_failed = !row.status.empty();
+                                for (const auto & range : uncovered) {
+                                    uintptr_t chunk_start = range.first;
+                                    while (!scan_failed && chunk_start < range.second) {
+                                        const uint64_t pages_left = (range.second - chunk_start) / ps;
+                                        const size_t chunk_pages = static_cast<size_t>(
+                                                std::min<uint64_t>(pages_left, mincore_chunk_pages));
+                                        const size_t chunk_bytes = chunk_pages * static_cast<size_t>(ps);
+
+                                        errno = 0;
+                                        if (mincore(reinterpret_cast<void *>(chunk_start), chunk_bytes, residency.data()) != 0) {
+                                            row.status = "mincore_failed";
+                                            row.error_no = errno;
+                                            any_unmeasured = true;
+                                            scan_failed = true;
+                                            break;
+                                        }
+
+                                        uint64_t resident = 0;
+                                        for (size_t page = 0; page < chunk_pages; ++page) {
+                                            resident += (residency[page] & 1U) != 0;
+                                        }
+                                        row.scanned_pages += chunk_pages;
+                                        row.resident_pages += resident;
+                                        total_scanned_pages += chunk_pages;
+                                        total_resident_pages += resident;
+                                        any_scanned = true;
+
+                                        const uintptr_t chunk_end = chunk_start + chunk_bytes;
+                                        add_covered_range(chunk_start, chunk_end);
+                                        chunk_start = chunk_end;
+                                    }
+                                    if (scan_failed) {
+                                        break;
+                                    }
+                                }
+
+                                row.has_counts = row.scanned_pages > 0;
+                                if (!scan_failed) {
+                                    if (uncovered_pages == 0) {
+                                        row.status = "overlap_deduplicated";
+                                    } else if (row.overlap_pages > 0) {
+                                        row.status = "ok_overlap_deduplicated";
+                                    } else {
+                                        row.status = "ok";
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+#endif
+        }
+
+        row.elapsed_ns = kv_residency_elapsed_ns(buffer_start);
+        rows.push_back(std::move(row));
+    }
+
+    kv_residency_row aggregate;
+    aggregate.allocated_bytes = total_allocated_bytes;
+    aggregate.scanned_pages = total_scanned_pages;
+    aggregate.resident_pages = total_resident_pages;
+    aggregate.overlap_pages = total_overlap_pages;
+    aggregate.has_counts = any_scanned;
+    if (total_allocated_overflow) {
+        aggregate.status = "aggregate_allocated_bytes_overflow";
+        aggregate.error_no = EOVERFLOW;
+    } else if (!any_scanned) {
+        aggregate.status = "no_scannable_buffers";
+    } else if (any_unmeasured) {
+        aggregate.status = "partial_failure";
+    } else {
+        aggregate.status = "ok";
+    }
+    aggregate.elapsed_ns = kv_residency_elapsed_ns(snapshot_start);
+
+    const char * path_env = std::getenv("LLAMA_KV_RESIDENCY_LOG_PATH");
+    const char * path = path_env && path_env[0] ? path_env : "kv_residency.csv";
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to open KV residency log '%s'\n", __func__, path);
+        return;
+    }
+    if (out.tellp() == 0) {
+        out << "schema_version,snapshot_id,ts_ns,event,stage,request_id,task_id,slot_id,record_type,"
+               "buffer_index,backend,allocated_bytes,page_size,aligned_start,aligned_end,scanned_pages,"
+               "resident_pages,resident_page_ratio,overlap_pages,elapsed_ns,status,errno\n";
+    }
+
+    auto write_common = [&](const char * record_type) {
+        out << "1," << snapshot_id << ',' << timestamp_ns << ','
+            << kv_residency_csv_field(event) << ',' << kv_residency_csv_field(stage) << ',';
+        if (fields.request_id >= 0) {
+            out << fields.request_id;
+        }
+        out << ',';
+        if (fields.task_id >= 0) {
+            out << fields.task_id;
+        }
+        out << ',';
+        if (fields.slot_id >= 0) {
+            out << fields.slot_id;
+        }
+        out << ',' << record_type << ',';
+    };
+
+    for (const auto & row : rows) {
+        write_common("BUFFER");
+        out << row.buffer_index << ',' << kv_residency_csv_field(row.backend.c_str()) << ','
+            << row.allocated_bytes << ',' << page_size << ',';
+        if (row.has_range) {
+            out << row.aligned_start;
+        }
+        out << ',';
+        if (row.has_range) {
+            out << row.aligned_end;
+        }
+        out << ',';
+        if (row.has_counts) {
+            out << row.scanned_pages;
+        }
+        out << ',';
+        if (row.has_counts) {
+            out << row.resident_pages;
+        }
+        out << ',';
+        if (row.has_counts && row.scanned_pages > 0) {
+            out << std::setprecision(9)
+                << static_cast<double>(row.resident_pages) / static_cast<double>(row.scanned_pages);
+        }
+        out << ',' << row.overlap_pages << ',' << row.elapsed_ns << ','
+            << kv_residency_csv_field(row.status.c_str()) << ',' << row.error_no << '\n';
+    }
+
+    write_common("AGGREGATE");
+    out << ",," << aggregate.allocated_bytes << ',' << page_size << ",,,";
+    if (aggregate.has_counts) {
+        out << aggregate.scanned_pages;
+    }
+    out << ',';
+    if (aggregate.has_counts) {
+        out << aggregate.resident_pages;
+    }
+    out << ',';
+    if (aggregate.has_counts && aggregate.scanned_pages > 0) {
+        out << std::setprecision(9)
+            << static_cast<double>(aggregate.resident_pages) / static_cast<double>(aggregate.scanned_pages);
+    }
+    out << ',' << aggregate.overlap_pages << ',' << aggregate.elapsed_ns << ','
+        << kv_residency_csv_field(aggregate.status.c_str()) << ',' << aggregate.error_no << '\n';
+    out.close();
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to write KV residency log '%s'\n", __func__, path);
+    }
 }
 
 uint32_t llama_kv_cache::get_n_stream() const {

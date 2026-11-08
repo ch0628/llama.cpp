@@ -109,6 +109,11 @@ struct phase_request_context {
 LLAMA_API phase_request_context & phase_active_request();
 
 LLAMA_API void phase_kv_snapshot(const llama_context * ctx, const char * name, phase_fields fields = {});
+LLAMA_API void kv_residency_snapshot(
+        const llama_context * ctx,
+        const char * event,
+        const char * stage,
+        phase_fields fields = {});
 
 inline void phase_set_call(uint64_t call_id, int64_t decode_step_idx = -1) {
     auto & call = phase_active_call();

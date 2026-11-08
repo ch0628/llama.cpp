@@ -158,6 +158,7 @@ public:
 
     uint32_t get_size()     const;
     void fill_phase_snapshot(phase_fields & fields) const;
+    void log_residency_snapshot(const char * event, const char * stage, const phase_fields & fields) const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;

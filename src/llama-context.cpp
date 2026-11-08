@@ -60,6 +60,26 @@ void phase_kv_snapshot(const llama_context * ctx, const char * name, phase_field
     }
 }
 
+void kv_residency_snapshot(
+        const llama_context * ctx,
+        const char * event,
+        const char * stage,
+        phase_fields fields) {
+    const char * enabled = std::getenv("LLAMA_KV_RESIDENCY_DIAGNOSTIC");
+    if (!ctx || !enabled || enabled[0] != '1' || enabled[1] != '\0') {
+        return;
+    }
+    if (const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory())) {
+        try {
+            kv->log_residency_snapshot(event, stage, fields);
+        } catch (const std::exception & error) {
+            LLAMA_LOG_ERROR("%s: KV residency snapshot failed: %s\n", __func__, error.what());
+        } catch (...) {
+            LLAMA_LOG_ERROR("%s: KV residency snapshot failed with an unknown error\n", __func__);
+        }
+    }
+}
+
 //
 // llama_context
 //
@@ -434,6 +454,7 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         phase_kv_snapshot(this, "KV_ALLOCATION_READY");
+        kv_residency_snapshot(this, "KV_ALLOCATION_READY", "INIT");
     }
 
     // init backends
