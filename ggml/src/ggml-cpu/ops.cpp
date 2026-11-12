@@ -13,10 +13,20 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iterator>
 #include <map>
 #include <mutex>
+#include <sstream>
+#include <string>
+#include <tuple>
 #include <unordered_map>
+#include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>
+#endif
 
 static bool ggml_cpu_attn_diagnostic_enabled() {
     static const bool enabled = [] {
@@ -34,13 +44,23 @@ static bool ggml_cpu_attn_timing_enabled() {
     return enabled;
 }
 
+static bool ggml_cpu_kv_coverage_enabled();
+
 static bool ggml_cpu_attn_linking_enabled() {
-    return ggml_cpu_attn_diagnostic_enabled() || ggml_cpu_attn_timing_enabled();
+    return ggml_cpu_attn_diagnostic_enabled() || ggml_cpu_attn_timing_enabled() || ggml_cpu_kv_coverage_enabled();
 }
 
 static bool ggml_cpu_kvb_diagnostic_enabled() {
     static const bool enabled = [] {
         const char * value = std::getenv("LLAMA_KVB_DIAGNOSTIC");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+}
+
+static bool ggml_cpu_kv_coverage_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("LLAMA_KV_PAGE_COVERAGE_DIAGNOSTIC");
         return value && value[0] == '1' && value[1] == '\0';
     }();
     return enabled;
@@ -61,18 +81,396 @@ struct ggml_cpu_kvb_work {
 struct ggml_cpu_attn_diag_entry {
     uint64_t graph_generation;
     int32_t layer;
+    ggml_cpu_kv_coverage_node_kind coverage_kind = GGML_CPU_KV_COVERAGE_NODE_FLASH;
     ggml_cpu_attn_diag_link link = {};
+    std::string unsupported_path;
+};
+
+struct ggml_cpu_kv_page_interval {
+    uint64_t first;
+    uint64_t last;
+};
+
+struct ggml_cpu_kv_layout {
+    const ggml_tensor * tensor;
+    int32_t layer;
+    ggml_cpu_kv_coverage_tensor_kind kind;
+    uintptr_t buffer_start;
+    uintptr_t buffer_end;
+    uintptr_t aligned_start;
+    uintptr_t aligned_end;
+    uintptr_t tensor_start;
+    uintptr_t tensor_end;
+    size_t page_size;
+    ggml_type type;
+    int64_t ne[GGML_MAX_DIMS];
+    size_t nb[GGML_MAX_DIMS];
+    bool active = true;
+    bool accessed = false;
+    bool logged = false;
+};
+
+struct ggml_cpu_kv_tile_detail {
+    int64_t q_start;
+    int64_t q_count;
+    int64_t query_head;
+    int64_t kv_head;
+    int64_t key_start;
+    int64_t key_count;
+};
+
+struct ggml_cpu_kv_coverage_record {
+    ggml_cpu_attn_diag_link link = {};
+    int32_t layer = -1;
+    int access_kind = -1;
+    int ith = -1;
+    std::string path;
+    std::string stage;
+    std::string input_kind;
+    std::string status = "ok";
+    uintptr_t buffer_start = 0;
+    uintptr_t buffer_end = 0;
+    uintptr_t aligned_start = 0;
+    uintptr_t aligned_end = 0;
+    size_t page_size = 0;
+    uint64_t source_ranges = 0;
+    uint64_t source_bytes = 0;
+    uintptr_t address_min = UINTPTR_MAX;
+    uintptr_t address_max = 0;
+    uint64_t kv_head_mask = 0;
+    std::vector<ggml_cpu_kv_page_interval> pages;
+    std::vector<ggml_cpu_kv_page_interval> keys;
+    std::vector<ggml_cpu_kv_tile_detail> tiles;
+};
+
+struct ggml_cpu_kv_local_coverage {
+    bool active = false;
+    ggml_cpu_kv_coverage_record record;
+    ggml_cpu_kv_layout layout = {};
+    uint64_t page_first = 0;
+    std::vector<uint64_t> page_bits;
+    std::vector<uint64_t> key_bits;
 };
 
 static std::mutex ggml_cpu_attn_diag_mutex;
 static std::unordered_map<const ggml_tensor *, ggml_cpu_attn_diag_entry> ggml_cpu_attn_diag_nodes;
+static std::vector<ggml_cpu_kv_layout> ggml_cpu_kv_layouts;
+static std::vector<ggml_cpu_kv_coverage_record> ggml_cpu_kv_coverage_records;
+
+static size_t ggml_cpu_kv_page_size() {
+    static const size_t page_size = [] {
+#if !defined(_WIN32)
+        const long value = sysconf(_SC_PAGESIZE);
+        if (value > 0) {
+            return (size_t) value;
+        }
+#endif
+        return (size_t) 4096;
+    }();
+    return page_size;
+}
+
+static bool ggml_cpu_kv_user_link(const ggml_cpu_attn_diag_link & link) {
+    return link.execution_id != 0 && link.request_id >= 0 && link.call_id != 0 && link.stage &&
+        (std::strcmp(link.stage, "PREFILL") == 0 || std::strcmp(link.stage, "DECODE") == 0);
+}
+
+static const char * ggml_cpu_kv_access_name(int kind) {
+    switch (kind) {
+        case 0: return "K_READ";
+        case 1: return "V_READ";
+        case 2: return "K_WRITE";
+        case 3: return "V_WRITE";
+        default: return "UNSUPPORTED";
+    }
+}
+
+static std::vector<ggml_cpu_kv_page_interval> ggml_cpu_kv_bits_to_intervals(const std::vector<uint64_t> & bits, uint64_t first) {
+    std::vector<ggml_cpu_kv_page_interval> result;
+    bool in_range = false;
+    uint64_t range_start = 0;
+    for (uint64_t i = 0; i < bits.size()*64; ++i) {
+        const bool set = (bits[i/64] & (UINT64_C(1) << (i%64))) != 0;
+        if (set && !in_range) {
+            range_start = first + i;
+            in_range = true;
+        } else if (!set && in_range) {
+            result.push_back({ range_start, first + i - 1 });
+            in_range = false;
+        }
+    }
+    if (in_range) {
+        result.push_back({ range_start, first + bits.size()*64 - 1 });
+    }
+    return result;
+}
+
+static void ggml_cpu_kv_normalize_intervals(std::vector<ggml_cpu_kv_page_interval> & intervals) {
+    if (intervals.empty()) {
+        return;
+    }
+    std::sort(intervals.begin(), intervals.end(), [](const auto & a, const auto & b) {
+        return a.first < b.first || (a.first == b.first && a.last < b.last);
+    });
+    size_t out = 0;
+    for (size_t i = 1; i < intervals.size(); ++i) {
+        if (intervals[i].first <= intervals[out].last + 1) {
+            intervals[out].last = std::max(intervals[out].last, intervals[i].last);
+        } else {
+            intervals[++out] = intervals[i];
+        }
+    }
+    intervals.resize(out + 1);
+}
+
+static bool ggml_cpu_kv_find_layout_locked(
+        const ggml_tensor * tensor,
+        int32_t layer,
+        ggml_cpu_kv_coverage_tensor_kind kind,
+        ggml_cpu_kv_layout & result) {
+    const uintptr_t address = (uintptr_t) tensor->data;
+    for (auto & layout : ggml_cpu_kv_layouts) {
+        if (layout.active && layout.layer == layer && layout.kind == kind &&
+                address >= layout.tensor_start && address < layout.tensor_end) {
+            layout.accessed = true;
+            result = layout;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cpu_kv_lookup_entry(const ggml_tensor * node, ggml_cpu_attn_diag_entry & result) {
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    const auto it = ggml_cpu_attn_diag_nodes.find(node);
+    if (it == ggml_cpu_attn_diag_nodes.end()) {
+        return false;
+    }
+    result = it->second;
+    return true;
+}
+
+static void ggml_cpu_kv_coverage_begin(
+        ggml_cpu_kv_local_coverage & work,
+        const ggml_tensor * node,
+        const ggml_tensor * tensor,
+        ggml_cpu_kv_coverage_tensor_kind tensor_kind,
+        int access_kind,
+        int ith,
+        const char * path) {
+    if (!ggml_cpu_kv_coverage_enabled()) {
+        return;
+    }
+    ggml_cpu_attn_diag_entry entry;
+    if (!ggml_cpu_kv_lookup_entry(node, entry) || !ggml_cpu_kv_user_link(entry.link)) {
+        return;
+    }
+    const ggml_cpu_kv_coverage_node_kind expected_node_kind =
+        access_kind == 0 || access_kind == 1 ? GGML_CPU_KV_COVERAGE_NODE_FLASH :
+        access_kind == 2 ? GGML_CPU_KV_COVERAGE_NODE_K_WRITE :
+                           GGML_CPU_KV_COVERAGE_NODE_V_WRITE;
+    if (entry.coverage_kind != expected_node_kind) {
+        return;
+    }
+    ggml_cpu_kv_layout layout;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+        if (!ggml_cpu_kv_find_layout_locked(tensor, entry.layer, tensor_kind, layout)) {
+            return;
+        }
+    }
+    work.active = true;
+    work.layout = layout;
+    work.record.link = entry.link;
+    work.record.layer = entry.layer;
+    work.record.access_kind = access_kind;
+    work.record.ith = ith;
+    work.record.path = path;
+    work.record.stage = entry.link.stage;
+    work.record.input_kind = entry.link.input_kind ? entry.link.input_kind : "UNKNOWN";
+    work.record.buffer_start = layout.buffer_start;
+    work.record.buffer_end = layout.buffer_end;
+    work.record.aligned_start = layout.aligned_start;
+    work.record.aligned_end = layout.aligned_end;
+    work.record.page_size = layout.page_size;
+    const uint64_t page_last = (layout.tensor_end - 1)/layout.page_size;
+    work.page_first = layout.tensor_start/layout.page_size;
+    work.page_bits.resize((page_last - work.page_first + 64)/64, 0);
+    const uint64_t n_keys = layout.ne[1] > 0 && layout.ne[2] > 0 ?
+        (uint64_t) layout.ne[1]*(uint64_t) layout.ne[2] : 0;
+    work.key_bits.resize((n_keys + 63)/64, 0);
+}
+
+static void ggml_cpu_kv_coverage_mark(
+        ggml_cpu_kv_local_coverage * work,
+        const void * pointer,
+        size_t bytes,
+        int64_t key,
+        int64_t kv_head) {
+    if (!work || !work->active || bytes == 0) {
+        return;
+    }
+    const uintptr_t start = (uintptr_t) pointer;
+    if (start > UINTPTR_MAX - bytes) {
+        work->record.status = "address_overflow";
+        return;
+    }
+    const uintptr_t end = start + bytes;
+    if (start < work->layout.tensor_start || end > work->layout.tensor_end) {
+        work->record.status = "outside_registered_tensor";
+        return;
+    }
+    const uint64_t first = start/work->layout.page_size;
+    const uint64_t last = (end - 1)/work->layout.page_size;
+    for (uint64_t page = first; page <= last; ++page) {
+        const uint64_t bit = page - work->page_first;
+        if (bit/64 < work->page_bits.size()) {
+            work->page_bits[bit/64] |= UINT64_C(1) << (bit%64);
+        }
+    }
+    if (key >= 0 && (uint64_t) key/64 < work->key_bits.size()) {
+        work->key_bits[(uint64_t) key/64] |= UINT64_C(1) << ((uint64_t) key%64);
+    }
+    if (kv_head >= 0 && kv_head < 64) {
+        work->record.kv_head_mask |= UINT64_C(1) << kv_head;
+    }
+    ++work->record.source_ranges;
+    work->record.source_bytes += bytes;
+    work->record.address_min = std::min(work->record.address_min, start);
+    work->record.address_max = std::max(work->record.address_max, end);
+}
+
+static void ggml_cpu_kv_coverage_tile(
+        ggml_cpu_kv_local_coverage * work,
+        int64_t q_start,
+        int64_t q_count,
+        int64_t query_head,
+        int64_t kv_head,
+        int64_t key_start,
+        int64_t key_count) {
+    if (work && work->active) {
+        work->record.tiles.push_back({ q_start, q_count, query_head, kv_head, key_start, key_count });
+    }
+}
+
+static void ggml_cpu_kv_coverage_finish(ggml_cpu_kv_local_coverage & work) {
+    if (!work.active || work.record.source_ranges == 0) {
+        return;
+    }
+    const auto absolute_pages = ggml_cpu_kv_bits_to_intervals(work.page_bits, work.page_first);
+    for (const auto & interval : absolute_pages) {
+        const uint64_t aligned_page = work.layout.aligned_start/work.layout.page_size;
+        work.record.pages.push_back({ interval.first - aligned_page, interval.last - aligned_page });
+    }
+    work.record.keys = ggml_cpu_kv_bits_to_intervals(work.key_bits, 0);
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    ggml_cpu_kv_coverage_records.push_back(std::move(work.record));
+}
 
 extern "C" void ggml_cpu_attn_diag_register_node(const ggml_tensor * node, uint64_t graph_generation, int32_t layer) {
     if (!ggml_cpu_attn_linking_enabled() || !graph_generation) {
         return;
     }
     std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
-    ggml_cpu_attn_diag_nodes[node] = { graph_generation, layer, {} };
+    ggml_cpu_attn_diag_nodes[node] = { graph_generation, layer, GGML_CPU_KV_COVERAGE_NODE_FLASH, {}, {} };
+}
+
+extern "C" void ggml_cpu_kv_coverage_register_node(
+        const ggml_tensor * node,
+        uint64_t graph_generation,
+        int32_t layer,
+        ggml_cpu_kv_coverage_node_kind kind) {
+    if (!ggml_cpu_kv_coverage_enabled() || !node || !graph_generation) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    ggml_cpu_attn_diag_nodes[node] = { graph_generation, layer, kind, {}, {} };
+}
+
+extern "C" void ggml_cpu_kv_coverage_register_tensor(
+        const ggml_tensor * tensor,
+        int32_t layer,
+        ggml_cpu_kv_coverage_tensor_kind kind) {
+    if (!ggml_cpu_kv_coverage_enabled() || !tensor || !tensor->buffer || !tensor->data ||
+            !ggml_backend_buffer_is_host(tensor->buffer)) {
+        return;
+    }
+    void * base_pointer = ggml_backend_buffer_get_base(tensor->buffer);
+    const size_t buffer_size = ggml_backend_buffer_get_size(tensor->buffer);
+    const size_t tensor_size = ggml_nbytes(tensor);
+    if (!base_pointer || buffer_size == 0 || tensor_size == 0) {
+        return;
+    }
+    const uintptr_t buffer_start = (uintptr_t) base_pointer;
+    const uintptr_t tensor_start = (uintptr_t) tensor->data;
+    if (buffer_start > UINTPTR_MAX - buffer_size || tensor_start > UINTPTR_MAX - tensor_size) {
+        return;
+    }
+    const uintptr_t buffer_end = buffer_start + buffer_size;
+    const uintptr_t tensor_end = tensor_start + tensor_size;
+    if (tensor_start < buffer_start || tensor_end > buffer_end) {
+        return;
+    }
+    const size_t page_size = ggml_cpu_kv_page_size();
+    const uintptr_t aligned_start = buffer_start - buffer_start%page_size;
+    if (buffer_end > UINTPTR_MAX - (page_size - 1)) {
+        return;
+    }
+    const uintptr_t aligned_end = ((buffer_end + page_size - 1)/page_size)*page_size;
+
+    ggml_cpu_kv_layout layout = {};
+    layout.tensor = tensor;
+    layout.layer = layer;
+    layout.kind = kind;
+    layout.buffer_start = buffer_start;
+    layout.buffer_end = buffer_end;
+    layout.aligned_start = aligned_start;
+    layout.aligned_end = aligned_end;
+    layout.tensor_start = tensor_start;
+    layout.tensor_end = tensor_end;
+    layout.page_size = page_size;
+    layout.type = tensor->type;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        layout.ne[i] = tensor->ne[i];
+        layout.nb[i] = tensor->nb[i];
+    }
+
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    for (auto & current : ggml_cpu_kv_layouts) {
+        if (current.tensor == tensor) {
+            current = layout;
+            return;
+        }
+    }
+    ggml_cpu_kv_layouts.push_back(layout);
+}
+
+extern "C" void ggml_cpu_kv_coverage_unregister_tensor(const ggml_tensor * tensor) {
+    if (!tensor) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    for (auto & layout : ggml_cpu_kv_layouts) {
+        if (layout.tensor == tensor) {
+            layout.active = false;
+        }
+    }
+}
+
+extern "C" void ggml_cpu_kv_coverage_mark_unsupported_backend(
+        const ggml_tensor * node,
+        const char * backend_name) {
+    if (!ggml_cpu_kv_coverage_enabled() || !node) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    const auto it = ggml_cpu_attn_diag_nodes.find(node);
+    if (it == ggml_cpu_attn_diag_nodes.end()) {
+        return;
+    }
+    it->second.coverage_kind = GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_BACKEND;
+    it->second.unsupported_path = "BACKEND:";
+    it->second.unsupported_path += backend_name && backend_name[0] ? backend_name : "UNASSIGNED";
 }
 
 extern "C" int ggml_cpu_attn_diag_bind_graph(const ggml_cgraph * graph, ggml_cpu_attn_diag_link link) {
@@ -86,6 +484,17 @@ extern "C" int ggml_cpu_attn_diag_bind_graph(const ggml_cgraph * graph, ggml_cpu
         if (it != ggml_cpu_attn_diag_nodes.end() && it->second.graph_generation == link.graph_generation) {
             it->second.link = link;
             it->second.link.layer = it->second.layer;
+            if (it->second.coverage_kind == GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_BACKEND &&
+                    ggml_cpu_kv_user_link(it->second.link)) {
+                ggml_cpu_kv_coverage_record record;
+                record.link = it->second.link;
+                record.layer = it->second.layer;
+                record.path = it->second.unsupported_path;
+                record.stage = it->second.link.stage;
+                record.input_kind = it->second.link.input_kind ? it->second.link.input_kind : "UNKNOWN";
+                record.status = "unsupported_path";
+                ggml_cpu_kv_coverage_records.push_back(std::move(record));
+            }
             ++count;
         }
     }
@@ -123,6 +532,217 @@ extern "C" int ggml_cpu_attn_diag_get_link(const ggml_tensor * node, ggml_cpu_at
     }
     *link = ggml_cpu_attn_diag_lookup(node);
     return link->execution_id != 0;
+}
+
+extern "C" void ggml_cpu_kv_coverage_record_unsupported(const ggml_tensor * node, const char * path, int ith) {
+    if (!ggml_cpu_kv_coverage_enabled() || ith != 0) {
+        return;
+    }
+    ggml_cpu_attn_diag_entry entry;
+    if (!ggml_cpu_kv_lookup_entry(node, entry) ||
+            entry.coverage_kind != GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_GENERAL ||
+            !ggml_cpu_kv_user_link(entry.link)) {
+        return;
+    }
+    ggml_cpu_kv_coverage_record record;
+    record.link = entry.link;
+    record.layer = entry.layer;
+    record.path = path ? path : "GENERAL";
+    record.stage = entry.link.stage;
+    record.input_kind = entry.link.input_kind ? entry.link.input_kind : "UNKNOWN";
+    record.status = "unsupported_path";
+    record.ith = ith;
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    ggml_cpu_kv_coverage_records.push_back(std::move(record));
+}
+
+static void ggml_cpu_kv_csv_field(std::ostream & output, const std::string & value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) {
+        output << value;
+        return;
+    }
+    output << '"';
+    for (char character : value) {
+        if (character == '"') {
+            output << '"';
+        }
+        output << character;
+    }
+    output << '"';
+}
+
+static std::string ggml_cpu_kv_interval_string(const std::vector<ggml_cpu_kv_page_interval> & intervals) {
+    std::ostringstream output;
+    for (size_t i = 0; i < intervals.size(); ++i) {
+        if (i) {
+            output << ';';
+        }
+        output << intervals[i].first;
+        if (intervals[i].last != intervals[i].first) {
+            output << '-' << intervals[i].last;
+        }
+    }
+    return output.str();
+}
+
+static std::string ggml_cpu_kv_tile_string(std::vector<ggml_cpu_kv_tile_detail> tiles) {
+    std::sort(tiles.begin(), tiles.end(), [](const auto & a, const auto & b) {
+        return std::tie(a.query_head, a.q_start, a.key_start, a.kv_head) <
+               std::tie(b.query_head, b.q_start, b.key_start, b.kv_head);
+    });
+    std::ostringstream output;
+    for (size_t i = 0; i < tiles.size(); ++i) {
+        if (i) {
+            output << ';';
+        }
+        output << "q" << tiles[i].q_start << '+' << tiles[i].q_count
+               << ":qh" << tiles[i].query_head
+               << ":kvh" << tiles[i].kv_head
+               << ":k" << tiles[i].key_start << '+' << tiles[i].key_count;
+    }
+    return output.str();
+}
+
+extern "C" void ggml_cpu_kv_coverage_flush(void) {
+    if (!ggml_cpu_kv_coverage_enabled()) {
+        return;
+    }
+
+    std::vector<ggml_cpu_kv_coverage_record> records;
+    std::vector<ggml_cpu_kv_layout> layouts;
+    {
+        std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+        records.swap(ggml_cpu_kv_coverage_records);
+        for (auto & layout : ggml_cpu_kv_layouts) {
+            if (layout.accessed && !layout.logged) {
+                layouts.push_back(layout);
+                layout.logged = true;
+            }
+        }
+    }
+    if (records.empty() && layouts.empty()) {
+        return;
+    }
+
+    using group_key = std::tuple<uint64_t, int32_t, int, uintptr_t, std::string>;
+    std::map<group_key, ggml_cpu_kv_coverage_record> groups;
+    for (auto & record : records) {
+        const group_key key = {
+            record.link.execution_id, record.layer, record.access_kind, record.buffer_start, record.path,
+        };
+        auto [it, inserted] = groups.emplace(key, record);
+        if (inserted) {
+            continue;
+        }
+        auto & current = it->second;
+        current.source_ranges += record.source_ranges;
+        current.source_bytes += record.source_bytes;
+        current.address_min = std::min(current.address_min, record.address_min);
+        current.address_max = std::max(current.address_max, record.address_max);
+        current.kv_head_mask |= record.kv_head_mask;
+        current.pages.insert(current.pages.end(), record.pages.begin(), record.pages.end());
+        current.keys.insert(current.keys.end(), record.keys.begin(), record.keys.end());
+        current.tiles.insert(current.tiles.end(), record.tiles.begin(), record.tiles.end());
+        if (current.status == "ok" && record.status != "ok") {
+            current.status = record.status;
+        }
+    }
+    for (auto & item : groups) {
+        ggml_cpu_kv_normalize_intervals(item.second.pages);
+        ggml_cpu_kv_normalize_intervals(item.second.keys);
+    }
+
+    const char * layout_path_env = std::getenv("LLAMA_KV_PAGE_COVERAGE_LAYOUT_PATH");
+    const char * summary_path_env = std::getenv("LLAMA_KV_PAGE_COVERAGE_SUMMARY_PATH");
+    const char * intervals_path_env = std::getenv("LLAMA_KV_PAGE_COVERAGE_INTERVALS_PATH");
+    const char * layout_path = layout_path_env && layout_path_env[0] ? layout_path_env : "kv_operator_tensor_layout.csv";
+    const char * summary_path = summary_path_env && summary_path_env[0] ? summary_path_env : "kv_operator_page_summary.csv";
+    const char * intervals_path = intervals_path_env && intervals_path_env[0] ? intervals_path_env : "kv_operator_page_intervals.csv";
+
+    if (!layouts.empty()) {
+        std::ofstream output(layout_path, std::ios::app);
+        if (output && output.tellp() == 0) {
+            output << "schema_version,layer,tensor_kind,type,buffer_id,buffer_start,buffer_end,allocated_bytes,aligned_start,aligned_end,page_size,tensor_start,tensor_end,tensor_bytes,tensor_buffer_offset,ne0,ne1,ne2,ne3,nb0,nb1,nb2,nb3,status\n";
+        }
+        for (const auto & layout : layouts) {
+            output << "1," << layout.layer << ','
+                   << (layout.kind == GGML_CPU_KV_COVERAGE_TENSOR_K ? "K" : "V") << ','
+                   << ggml_type_name(layout.type) << ',' << layout.buffer_start << ','
+                   << layout.buffer_start << ',' << layout.buffer_end << ',' << layout.buffer_end - layout.buffer_start << ','
+                   << layout.aligned_start << ',' << layout.aligned_end << ',' << layout.page_size << ','
+                   << layout.tensor_start << ',' << layout.tensor_end << ',' << layout.tensor_end - layout.tensor_start << ','
+                   << layout.tensor_start - layout.buffer_start;
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                output << ',' << layout.ne[i];
+            }
+            for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+                output << ',' << layout.nb[i];
+            }
+            output << ",ok\n";
+        }
+    }
+
+    std::ofstream summary(summary_path, std::ios::app);
+    std::ofstream intervals(intervals_path, std::ios::app);
+    if (summary && summary.tellp() == 0) {
+        summary << "schema_version,execution_id,request_id,task_id,slot_id,call_id,ubatch_idx,stage,input_kind,layer,access_kind,kernel_path,buffer_id,buffer_start,buffer_end,aligned_start,page_size,source_range_count,source_bytes,unique_pages,page_interval_count,address_min,address_max_exclusive,key_index_rle,kv_head_mask,tile_coordinates,status,dram_traffic\n";
+    }
+    if (intervals && intervals.tellp() == 0) {
+        intervals << "schema_version,execution_id,request_id,call_id,ubatch_idx,stage,layer,access_kind,kernel_path,buffer_id,interval_index,buffer_page_start,buffer_page_end,virtual_page_start,virtual_page_end,address_start,address_end_exclusive,page_count,status\n";
+    }
+
+    for (auto & item : groups) {
+        const auto & record = item.second;
+        uint64_t unique_pages = 0;
+        for (const auto & interval : record.pages) {
+            unique_pages += interval.last - interval.first + 1;
+        }
+        summary << "1," << record.link.execution_id << ',' << record.link.request_id << ','
+                << record.link.task_id << ',' << record.link.slot_id << ',' << record.link.call_id << ','
+                << record.link.ubatch_idx << ',';
+        ggml_cpu_kv_csv_field(summary, record.stage);
+        summary << ',';
+        ggml_cpu_kv_csv_field(summary, record.input_kind);
+        summary << ',' << record.layer << ',' << ggml_cpu_kv_access_name(record.access_kind) << ',';
+        ggml_cpu_kv_csv_field(summary, record.path);
+        summary << ',' << record.buffer_start << ',' << record.buffer_start << ',' << record.buffer_end << ','
+                << record.aligned_start << ',' << record.page_size << ',' << record.source_ranges << ','
+                << record.source_bytes << ',' << unique_pages << ',' << record.pages.size() << ',';
+        if (record.address_min != UINTPTR_MAX) {
+            summary << record.address_min;
+        }
+        summary << ',';
+        if (record.address_max != 0) {
+            summary << record.address_max;
+        }
+        summary << ',';
+        ggml_cpu_kv_csv_field(summary, ggml_cpu_kv_interval_string(record.keys));
+        summary << ',' << record.kv_head_mask << ',';
+        ggml_cpu_kv_csv_field(summary, ggml_cpu_kv_tile_string(record.tiles));
+        summary << ',' << record.status << ",not_measured\n";
+
+        for (size_t i = 0; i < record.pages.size(); ++i) {
+            const auto & interval = record.pages[i];
+            const uint64_t virtual_first = record.aligned_start/record.page_size + interval.first;
+            const uint64_t virtual_last = record.aligned_start/record.page_size + interval.last;
+            intervals << "1," << record.link.execution_id << ',' << record.link.request_id << ','
+                      << record.link.call_id << ',' << record.link.ubatch_idx << ',';
+            ggml_cpu_kv_csv_field(intervals, record.stage);
+            intervals << ',' << record.layer << ',' << ggml_cpu_kv_access_name(record.access_kind) << ',';
+            ggml_cpu_kv_csv_field(intervals, record.path);
+            intervals << ',' << record.buffer_start << ',' << i << ',' << interval.first << ',' << interval.last << ','
+                      << virtual_first << ',' << virtual_last << ',' << virtual_first*record.page_size << ','
+                      << (virtual_last + 1)*record.page_size << ',' << interval.last - interval.first + 1 << ','
+                      << record.status << '\n';
+        }
+    }
+}
+
+extern "C" void ggml_cpu_kv_coverage_reset_for_test(void) {
+    std::lock_guard<std::mutex> lock(ggml_cpu_attn_diag_mutex);
+    ggml_cpu_kv_coverage_records.clear();
+    ggml_cpu_kv_layouts.clear();
+    ggml_cpu_attn_diag_nodes.clear();
 }
 
 static void ggml_cpu_attn_diag_print_link(const ggml_cpu_attn_diag_link & link) {
@@ -640,6 +1260,7 @@ static void ggml_compute_forward_dup_from_q(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
     const int dr = (nr + nth - 1)/nth;
 
     // row range for this thread
@@ -5385,6 +6006,12 @@ static void ggml_compute_forward_set_rows_impl(
     const int ith = params->ith;
     const int nth = params->nth;
 
+    ggml_cpu_kv_local_coverage k_coverage;
+    ggml_cpu_kv_local_coverage v_coverage;
+    ggml_cpu_kv_coverage_begin(k_coverage, dst, dst->src[2], GGML_CPU_KV_COVERAGE_TENSOR_K, 2, ith, "SET_ROWS");
+    ggml_cpu_kv_coverage_begin(v_coverage, dst, dst->src[2], GGML_CPU_KV_COVERAGE_TENSOR_V, 3, ith, "SET_ROWS");
+    ggml_cpu_kv_local_coverage * coverage = k_coverage.active ? &k_coverage : v_coverage.active ? &v_coverage : nullptr;
+
     // rows per thread
     const int64_t dr = (nr + nth - 1)/nth;
 
@@ -5407,14 +6034,16 @@ static void ggml_compute_forward_set_rows_impl(
 
                 GGML_ASSERT(i1 >= 0 && i1 < ne1);
 
+                void * dst_row = (char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3;
+
                 if constexpr (std::is_same_v<src_t, float>) {
                     from_float(
                             (const float *) ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
-                                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3), nc);
+                                            dst_row, nc);
                 } else if constexpr (std::is_same_v<src_t, ggml_fp16_t>) {
                     if (dst->type == GGML_TYPE_F16) {
                         memcpy(
-                                            ((char *)  dst->data + i1*nb1  + i02*nb2  + i03*nb3),
+                                            dst_row,
                                             ((char *) src0->data +  i*nb01 + i02*nb02 + i03*nb03),
                                             rs);
                     } else {
@@ -5422,15 +6051,17 @@ static void ggml_compute_forward_set_rows_impl(
                         ggml_fp16_to_fp32_row(
                                 (const ggml_fp16_t *) ((char *) src0->data + i*nb01 + i02*nb02 + i03*nb03),
                                 wdata, nc);
-                        from_float(wdata,
-                                ((char *) dst->data + i1*nb1 + i02*nb2 + i03*nb3), nc);
+                        from_float(wdata, dst_row, nc);
                     }
                 } else {
                     GGML_ABORT("src0->type = %d (%s) not supported", src0->type, ggml_type_name(src0->type));
                 }
+                ggml_cpu_kv_coverage_mark(coverage, dst_row, ggml_row_size(dst->type, nc), i1, -1);
             }
         }
     }
+    ggml_cpu_kv_coverage_finish(k_coverage);
+    ggml_cpu_kv_coverage_finish(v_coverage);
 }
 
 void ggml_compute_forward_set_rows(
@@ -8762,7 +9393,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         int ir0, int ir1,
         int64_t ic_start, int64_t ic_end,
         float * partials, int64_t partial_stride,
-        ggml_cpu_kvb_work * kvb_work) {
+        ggml_cpu_kvb_work * kvb_work,
+        ggml_cpu_kv_local_coverage * k_coverage,
+        ggml_cpu_kv_local_coverage * v_coverage) {
 
     const bool write_partials = (partials != nullptr);
     const ggml_tensor * q     = dst->src[0];
@@ -8893,6 +9526,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float s; // KQ value
 
             const char * k_data = (const char *) k->data + ( ic*nbk1 + ik2*nbk2 + ik3*nbk3);
+            ggml_cpu_kv_coverage_mark(k_coverage, k_data, ggml_row_size(k->type, DK), ic, ik2);
             if (kvb_work) {
                 ++kvb_work->dot_calls;
             }
@@ -8912,6 +9546,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             float vs = 1.0f; // post-softmax KQ value, expf(s - M)
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
+            ggml_cpu_kv_coverage_mark(v_coverage, v_data, ggml_row_size(v->type, DV), ic, iv2);
 
             if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
@@ -9005,7 +9640,9 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
         const ggml_compute_params * params,
         ggml_tensor * dst,
         int ir0, int ir1,
-        ggml_cpu_kvb_work * kvb_work) {
+        ggml_cpu_kvb_work * kvb_work,
+        ggml_cpu_kv_local_coverage * k_coverage,
+        ggml_cpu_kv_local_coverage * v_coverage) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -9188,10 +9825,14 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
                 }
             }
 
+            ggml_cpu_kv_coverage_tile(k_coverage, iq1, tile_rows, iq2, ik2, ic, kv_tile);
+            ggml_cpu_kv_coverage_tile(v_coverage, iq1, tile_rows, iq2, iv2, ic, kv_tile);
+
             // Pack K tile transposed: K_f32[dk][kv] so KV_TILE is contiguous (SIMD dim)
             // Zero-pad the last tile so the GEMM always operates on KV_TILE_SZ columns
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * k_data = (const char *)k->data + (ic + tk)*nbk1 + ik2*nbk2 + ik3*nbk3;
+                ggml_cpu_kv_coverage_mark(k_coverage, k_data, ggml_row_size(k->type, DK), ic + tk, ik2);
                 if (kv_type == GGML_TYPE_F16) {
                     const ggml_fp16_t * k_f16 = (const ggml_fp16_t *)k_data;
                     for (int64_t dk = 0; dk < DK; dk++) {
@@ -9257,6 +9898,7 @@ static void ggml_compute_forward_flash_attn_ext_tiled(
             // Pack V tile to contiguous F32, zero-padded
             for (int tk = 0; tk < kv_tile; tk++) {
                 const char * v_data = (const char *)v->data + (ic + tk)*nbv1 + iv2*nbv2 + iv3*nbv3;
+                ggml_cpu_kv_coverage_mark(v_coverage, v_data, ggml_row_size(v->type, DV), ic + tk, iv2);
                 if (kv_type == GGML_TYPE_F16) {
                     ggml_cpu_fp16_to_fp32((const ggml_fp16_t *)v_data, V32 + tk * DV, DV);
                 } else {
@@ -9427,6 +10069,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 
     ggml_cpu_kvb_work kvb_work;
     ggml_cpu_kvb_work * work = ggml_cpu_kvb_diagnostic_enabled() ? &kvb_work : nullptr;
+    ggml_cpu_kv_local_coverage k_coverage;
+    ggml_cpu_kv_local_coverage v_coverage;
 
     // When use_ref is set, force the vec-only reference implementation (no tiling, no KV-chunking)
     const bool use_ref = params->use_ref;
@@ -9435,6 +10079,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const bool use_split_kv_path = !use_ref && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
+        ggml_cpu_kv_coverage_begin(k_coverage, dst, k, GGML_CPU_KV_COVERAGE_TENSOR_K, 0, ith, "SPLIT_KV");
+        ggml_cpu_kv_coverage_begin(v_coverage, dst, v, GGML_CPU_KV_COVERAGE_TENSOR_V, 1, ith, "SPLIT_KV");
         if (params->attn_timing_path) {
             *params->attn_timing_path = GGML_CPU_ATTN_KERNEL_SPLIT_KV;
         }
@@ -9470,7 +10116,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
                 ggml_compute_forward_flash_attn_ext_f16_one_chunk(
                     params, dst, q_head, q_head + 1, ic_start, ic_end,
-                    chunk_partials, partial_stride, work);
+                    chunk_partials, partial_stride, work, &k_coverage, &v_coverage);
             }
         } else {
             for (int64_t q_head = 0; q_head < neq2; q_head++) {
@@ -9524,6 +10170,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
 #endif
         use_tiled &= (DV % f32_epr == 0);
 #endif
+        const char * coverage_path = use_tiled ? "TILED" : "ONE_CHUNK";
+        ggml_cpu_kv_coverage_begin(k_coverage, dst, k, GGML_CPU_KV_COVERAGE_TENSOR_K, 0, ith, coverage_path);
+        ggml_cpu_kv_coverage_begin(v_coverage, dst, v, GGML_CPU_KV_COVERAGE_TENSOR_V, 1, ith, coverage_path);
         if (params->attn_timing_path) {
             *params->attn_timing_path = use_tiled ? GGML_CPU_ATTN_KERNEL_TILED : GGML_CPU_ATTN_KERNEL_ONE_CHUNK;
         }
@@ -9551,9 +10200,9 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
             if (use_tiled) {
-                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1, work);
+                ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1, work, &k_coverage, &v_coverage);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0, work);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, nek1, nullptr, 0, work, &k_coverage, &v_coverage);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);
@@ -9562,6 +10211,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             ggml_cpu_kvb_print_work(dst, use_tiled ? "TILED" : "ONE_CHUNK", ith, nth, 0, nek1, kvb_work);
         }
     }
+    ggml_cpu_kv_coverage_finish(k_coverage);
+    ggml_cpu_kv_coverage_finish(v_coverage);
 }
 
 void ggml_compute_forward_flash_attn_ext(

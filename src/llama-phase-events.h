@@ -114,6 +114,10 @@ LLAMA_API void kv_residency_snapshot(
         const char * event,
         const char * stage,
         phase_fields fields = {});
+LLAMA_API void page_activity_snapshot(
+        const char * event,
+        const char * stage,
+        phase_fields fields = {});
 
 inline void phase_set_call(uint64_t call_id, int64_t decode_step_idx = -1) {
     auto & call = phase_active_call();

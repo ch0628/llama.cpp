@@ -20,7 +20,27 @@ extern "C" {
         const char * input_kind;
     };
 
+    enum ggml_cpu_kv_coverage_node_kind {
+        GGML_CPU_KV_COVERAGE_NODE_FLASH = 0,
+        GGML_CPU_KV_COVERAGE_NODE_K_WRITE,
+        GGML_CPU_KV_COVERAGE_NODE_V_WRITE,
+        GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_GENERAL,
+        GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_BACKEND,
+    };
+
+    enum ggml_cpu_kv_coverage_tensor_kind {
+        GGML_CPU_KV_COVERAGE_TENSOR_K = 0,
+        GGML_CPU_KV_COVERAGE_TENSOR_V,
+    };
+
     GGML_BACKEND_API void ggml_cpu_attn_diag_register_node(const struct ggml_tensor * node, uint64_t graph_generation, int32_t layer);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_register_node(const struct ggml_tensor * node, uint64_t graph_generation, int32_t layer, enum ggml_cpu_kv_coverage_node_kind kind);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_register_tensor(const struct ggml_tensor * tensor, int32_t layer, enum ggml_cpu_kv_coverage_tensor_kind kind);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_unregister_tensor(const struct ggml_tensor * tensor);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_mark_unsupported_backend(const struct ggml_tensor * node, const char * backend_name);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_record_unsupported(const struct ggml_tensor * node, const char * path, int ith);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_flush(void);
+    GGML_BACKEND_API void ggml_cpu_kv_coverage_reset_for_test(void);
     GGML_BACKEND_API int  ggml_cpu_attn_diag_bind_graph(const struct ggml_cgraph * graph, struct ggml_cpu_attn_diag_link link);
     GGML_BACKEND_API void ggml_cpu_attn_diag_clear_generation(uint64_t graph_generation);
     GGML_BACKEND_API int  ggml_cpu_attn_diag_get_link(const struct ggml_tensor * node, struct ggml_cpu_attn_diag_link * link);

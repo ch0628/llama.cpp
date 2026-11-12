@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "unicode.h"
+#include "../src/llama-phase-events.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -1581,8 +1582,15 @@ char * common_get_model_or_exit(int argc, char * argv[]) {
 }
 
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
+    const auto check_span = phase_event("common", "SEQ_RM_COMPAT_CHECK_START", phase_kind::START);
+    page_activity_snapshot("SEQ_RM_COMPAT_CHECK_START", "SEQ_RM_CHECK_START");
+
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
+        phase_fields fields;
+        fields.status = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        phase_event("common", "SEQ_RM_COMPAT_CHECK_END", phase_kind::END, check_span, fields);
+        page_activity_snapshot("SEQ_RM_COMPAT_CHECK_END", "SEQ_RM_CHECK_END");
         return COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     }
 
@@ -1595,7 +1603,13 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     tmp.push_back(0);
     tmp.push_back(0);
 
+    const auto decode_span = phase_event("common", "SEQ_RM_LLAMA_DECODE_START", phase_kind::START);
+    page_activity_snapshot("SEQ_RM_LLAMA_DECODE_START", "SEQ_RM_DECODE_START");
     int ret = llama_decode(ctx, llama_batch_get_one(tmp.data(), tmp.size()));
+    phase_fields decode_fields;
+    decode_fields.status = ret;
+    phase_event("common", "SEQ_RM_LLAMA_DECODE_RETURN", phase_kind::END, decode_span, decode_fields);
+    page_activity_snapshot("SEQ_RM_LLAMA_DECODE_RETURN", "SEQ_RM_DECODE_END");
     if (ret != 0) {
         COM_ERR("llama_decode() failed: %d\n", ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
@@ -1618,6 +1632,11 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
 done:
     llama_memory_clear(mem, true);
     llama_synchronize(ctx);
+
+    phase_fields fields;
+    fields.status = res;
+    phase_event("common", "SEQ_RM_COMPAT_CHECK_END", phase_kind::END, check_span, fields);
+    page_activity_snapshot("SEQ_RM_COMPAT_CHECK_END", "SEQ_RM_CHECK_END");
 
     return res;
 }

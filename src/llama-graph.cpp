@@ -2731,6 +2731,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         const uint64_t graph_generation = phase_active_graph_generation();
         if (use_flash_attn) {
             ggml_cpu_attn_diag_register_node(diag_op, graph_generation, il);
+        } else if (llama_kv_page_coverage_enabled()) {
+            ggml_cpu_kv_coverage_register_node(diag_op, graph_generation, il, GGML_CPU_KV_COVERAGE_NODE_UNSUPPORTED_GENERAL);
         }
         if (llama_attn_diagnostic_enabled()) {
             flockfile(stderr);
@@ -2900,8 +2902,15 @@ ggml_tensor * llm_graph_context::build_attn(
         const auto & k_idxs = inp->get_k_idxs();
         const auto & v_idxs = inp->get_v_idxs();
 
-        ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il));
-        ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il));
+        ggml_tensor * k_store = mctx_cur->cpy_k(ctx0, k_cur, k_idxs, il);
+        ggml_tensor * v_store = mctx_cur->cpy_v(ctx0, v_cur, v_idxs, il);
+        if (llama_kv_page_coverage_enabled()) {
+            const uint64_t graph_generation = phase_active_graph_generation();
+            ggml_cpu_kv_coverage_register_node(k_store, graph_generation, il, GGML_CPU_KV_COVERAGE_NODE_K_WRITE);
+            ggml_cpu_kv_coverage_register_node(v_store, graph_generation, il, GGML_CPU_KV_COVERAGE_NODE_V_WRITE);
+        }
+        ggml_build_forward_expand(gf, k_store);
+        ggml_build_forward_expand(gf, v_store);
     }
 
     ggml_tensor * kq_mask = inp->get_kq_mask();

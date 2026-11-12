@@ -11,6 +11,7 @@
 #include "fit.h"
 #include "llama.h"
 #include "log.h"
+#include "phase-events.h"
 
 #include <atomic>
 #include <clocale>
@@ -485,6 +486,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
         routes.update_meta(ctx_server);
         ctx_http.is_ready.store(true);
+
+        phase_event("server", "SERVER_READY", phase_kind::POINT);
+        page_activity_snapshot("SERVER_READY", "SERVER_READY");
 
         SRV_INF("%s", "model loaded\n");
 

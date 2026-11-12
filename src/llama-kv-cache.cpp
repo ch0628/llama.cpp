@@ -1,4 +1,7 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-repeated-activity.h"
+#include "llama-kv-residency.h"
+#include "llama-kv-vma.h"
 #include "llama-phase-events.h"
 #include "llama-attention-diagnostic.h"
 
@@ -6,6 +9,8 @@
 #include "llama-io.h"
 #include "llama-model.h"
 #include "llama-context.h"
+
+#include "ggml-cpu.h"
 
 #include <algorithm>
 #include <cassert>
@@ -17,10 +22,12 @@
 #include <iomanip>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <string>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -48,6 +55,90 @@ struct kv_residency_row {
     bool has_counts = false;
 };
 
+struct kv_residency_bitmap_row {
+    size_t buffer_index = 0;
+    uintptr_t buffer_id = 0;
+    std::string backend;
+    uint64_t allocated_bytes = 0;
+    uintptr_t aligned_start = 0;
+    uintptr_t aligned_end = 0;
+    uint64_t page_size = 0;
+    llama_kv_residency::bitmap bitmap;
+    uint64_t resident_pages = 0;
+    uint64_t file_offset = 0;
+    bool complete = false;
+    bool persisted = false;
+    std::string status;
+    int error_no = 0;
+};
+
+struct kv_residency_bitmap_snapshot {
+    uint64_t snapshot_id = 0;
+    uint64_t timestamp_ns = 0;
+    std::string event;
+    std::string stage;
+    int64_t request_id = -1;
+    int64_t task_id = -1;
+    int64_t slot_id = -1;
+    std::vector<kv_residency_bitmap_row> buffers;
+    uint64_t snapshot_elapsed_ns = 0;
+    uint64_t persist_elapsed_ns = 0;
+    bool complete = false;
+    std::string status;
+
+    uint64_t bitmap_bytes() const {
+        uint64_t result = 0;
+        for (const auto & buffer : buffers) {
+            result += buffer.bitmap.data.size();
+        }
+        return result;
+    }
+};
+
+struct kv_residency_transition_buffer {
+    size_t buffer_index = 0;
+    uintptr_t buffer_id = 0;
+    uintptr_t aligned_start = 0;
+    uintptr_t aligned_end = 0;
+    uint64_t page_size = 0;
+    llama_kv_residency::transition_counts counts;
+};
+
+struct kv_residency_transition_report {
+    uint64_t comparison_id = 0;
+    std::string interval;
+    int64_t request_id = -1;
+    uint64_t previous_snapshot_id = 0;
+    uint64_t current_snapshot_id = 0;
+    std::string previous_event;
+    std::string current_event;
+    std::vector<kv_residency_transition_buffer> buffers;
+    llama_kv_residency::transition_counts aggregate;
+    uint64_t elapsed_ns = 0;
+    uint64_t retained_bytes = 0;
+    uint64_t peak_retained_bytes = 0;
+    bool valid = false;
+    std::string status;
+};
+
+struct kv_vma_buffer_row {
+    size_t buffer_index = 0;
+    uintptr_t buffer_id = 0;
+    std::string backend;
+    uint64_t allocated_bytes = 0;
+    uint64_t page_size = 0;
+    uintptr_t buffer_start = 0;
+    uintptr_t buffer_end = 0;
+    uintptr_t aligned_start = 0;
+    uintptr_t aligned_end = 0;
+    llama_kv_vma::report mappings;
+    std::string status;
+    int error_no = 0;
+    bool has_range = false;
+    bool has_aligned_range = false;
+    bool has_report = false;
+};
+
 static std::string kv_residency_csv_field(const char * value) {
     std::string result = "\"";
     for (const char * p = value ? value : ""; *p; ++p) {
@@ -65,7 +156,618 @@ static uint64_t kv_residency_elapsed_ns(const std::chrono::steady_clock::time_po
             std::chrono::steady_clock::now() - start).count();
 }
 
+static bool kv_residency_env_enabled(const char * name) {
+    return llama_kv_residency::enabled_value(std::getenv(name));
+}
+
+static uint64_t kv_residency_count_bits(const llama_kv_residency::bitmap & bitmap) {
+    uint64_t result = 0;
+    for (uint64_t page = 0; page < bitmap.page_count; ++page) {
+        result += bitmap.get(page);
+    }
+    return result;
+}
+
+static const char * kv_residency_env_path(const char * name, const char * fallback) {
+    const char * value = std::getenv(name);
+    return value && value[0] ? value : fallback;
+}
+
+static bool kv_residency_persist_bitmaps(kv_residency_bitmap_snapshot & snapshot) {
+    const char * path = kv_residency_env_path("LLAMA_KV_RESIDENCY_BITMAP_PATH", "kv_residency_bitmaps.bin");
+    std::ofstream out(path, std::ios::binary | std::ios::app);
+    if (!out) {
+        const int error_no = errno;
+        for (auto & buffer : snapshot.buffers) {
+            if (buffer.complete) {
+                buffer.complete = false;
+                buffer.status = "bitmap_file_open_failed";
+                buffer.error_no = error_no;
+            }
+        }
+        snapshot.complete = false;
+        snapshot.status = "bitmap_file_open_failed";
+        LLAMA_LOG_ERROR("%s: failed to open KV residency bitmap file '%s'\n", __func__, path);
+        return false;
+    }
+
+    for (auto & buffer : snapshot.buffers) {
+        if (!buffer.complete) {
+            continue;
+        }
+        const std::streampos position = out.tellp();
+        if (position < 0) {
+            buffer.complete = false;
+            buffer.status = "bitmap_offset_failed";
+            snapshot.complete = false;
+            snapshot.status = "bitmap_write_failed";
+            break;
+        }
+        buffer.file_offset = static_cast<uint64_t>(position);
+        if (!buffer.bitmap.data.empty()) {
+            out.write(reinterpret_cast<const char *>(buffer.bitmap.data.data()), buffer.bitmap.data.size());
+        }
+        if (!out) {
+            buffer.complete = false;
+            buffer.status = "bitmap_write_failed";
+            snapshot.complete = false;
+            snapshot.status = "bitmap_write_failed";
+            break;
+        }
+        buffer.persisted = true;
+    }
+    for (auto & buffer : snapshot.buffers) {
+        if (buffer.complete && !buffer.persisted) {
+            buffer.complete = false;
+            buffer.status = "bitmap_not_persisted";
+        }
+    }
+    out.close();
+    if (!out) {
+        for (auto & buffer : snapshot.buffers) {
+            if (buffer.persisted) {
+                buffer.complete = false;
+                buffer.persisted = false;
+                buffer.status = "bitmap_write_failed";
+            }
+        }
+        snapshot.complete = false;
+        snapshot.status = "bitmap_write_failed";
+        LLAMA_LOG_ERROR("%s: failed to write KV residency bitmap file '%s'\n", __func__, path);
+        return false;
+    }
+    return snapshot.complete;
+}
+
+static bool kv_residency_write_bitmap_index(const kv_residency_bitmap_snapshot & snapshot) {
+    const char * path = kv_residency_env_path("LLAMA_KV_RESIDENCY_BITMAP_INDEX_PATH", "kv_residency_bitmaps.csv");
+    const char * bitmap_path = kv_residency_env_path("LLAMA_KV_RESIDENCY_BITMAP_PATH", "kv_residency_bitmaps.bin");
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to open KV residency bitmap index '%s'\n", __func__, path);
+        return false;
+    }
+    if (out.tellp() == 0) {
+        out << "schema_version,snapshot_id,ts_ns,event,stage,request_id,task_id,slot_id,record_type,"
+               "buffer_index,buffer_id,backend,allocated_bytes,page_size,aligned_start,aligned_end,page_count,"
+               "resident_pages,bitmap_path,bitmap_offset,bitmap_bytes,valid,snapshot_elapsed_ns,"
+               "persist_elapsed_ns,retained_bytes,status,errno\n";
+    }
+
+    auto write_common = [&](const char * record_type) {
+        out << "1," << snapshot.snapshot_id << ',' << snapshot.timestamp_ns << ','
+            << kv_residency_csv_field(snapshot.event.c_str()) << ','
+            << kv_residency_csv_field(snapshot.stage.c_str()) << ',';
+        if (snapshot.request_id >= 0) {
+            out << snapshot.request_id;
+        }
+        out << ',';
+        if (snapshot.task_id >= 0) {
+            out << snapshot.task_id;
+        }
+        out << ',';
+        if (snapshot.slot_id >= 0) {
+            out << snapshot.slot_id;
+        }
+        out << ',' << record_type << ',';
+    };
+
+    for (const auto & buffer : snapshot.buffers) {
+        write_common("BUFFER");
+        out << buffer.buffer_index << ',' << buffer.buffer_id << ',' << kv_residency_csv_field(buffer.backend.c_str()) << ','
+            << buffer.allocated_bytes << ',' << buffer.page_size << ',';
+        if (buffer.aligned_end > buffer.aligned_start) {
+            out << buffer.aligned_start;
+        }
+        out << ',';
+        if (buffer.aligned_end > buffer.aligned_start) {
+            out << buffer.aligned_end;
+        }
+        out << ',';
+        if (buffer.bitmap.page_count > 0) {
+            out << buffer.bitmap.page_count;
+        }
+        out << ',';
+        if (buffer.complete && buffer.persisted) {
+            out << buffer.resident_pages;
+        }
+        out << ',' << kv_residency_csv_field(bitmap_path) << ',';
+        if (buffer.persisted) {
+            out << buffer.file_offset;
+        }
+        out << ',';
+        if (buffer.persisted) {
+            out << buffer.bitmap.data.size();
+        }
+        out << ',' << (buffer.complete && buffer.persisted ? 1 : 0) << ','
+            << snapshot.snapshot_elapsed_ns << ',' << snapshot.persist_elapsed_ns << ','
+            << snapshot.bitmap_bytes() << ',' << kv_residency_csv_field(buffer.status.c_str()) << ','
+            << buffer.error_no << '\n';
+    }
+
+    write_common("AGGREGATE");
+    out << ",,,,,,,,,,,," << (snapshot.complete ? 1 : 0) << ','
+        << snapshot.snapshot_elapsed_ns << ',' << snapshot.persist_elapsed_ns << ','
+        << snapshot.bitmap_bytes() << ',' << kv_residency_csv_field(snapshot.status.c_str()) << ",0\n";
+    out.close();
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to write KV residency bitmap index '%s'\n", __func__, path);
+        return false;
+    }
+    return true;
+}
+
+static kv_residency_transition_report kv_residency_compare_snapshots(
+        uint64_t comparison_id,
+        const char * interval,
+        const kv_residency_bitmap_snapshot * previous,
+        const kv_residency_bitmap_snapshot & current) {
+    const auto start = std::chrono::steady_clock::now();
+    kv_residency_transition_report report;
+    report.comparison_id = comparison_id;
+    report.interval = interval;
+    report.request_id = current.request_id;
+    report.current_snapshot_id = current.snapshot_id;
+    report.current_event = current.event;
+    if (!previous) {
+        report.status = std::string(interval) == "INIT_TO_REQUEST_START" ?
+            "no_valid_init_snapshot" : "previous_snapshot_unavailable";
+    } else {
+        report.previous_snapshot_id = previous->snapshot_id;
+        report.previous_event = previous->event;
+        if (!previous->complete || !current.complete) {
+            report.status = "snapshot_incomplete";
+        } else if (previous->buffers.size() != current.buffers.size()) {
+            report.status = "buffer_set_changed";
+        } else {
+            std::vector<llama_kv_residency::transition_bitmap_range> ranges;
+            ranges.reserve(current.buffers.size());
+            for (size_t i = 0; i < current.buffers.size(); ++i) {
+                const auto & before = previous->buffers[i];
+                const auto & after = current.buffers[i];
+                if (before.buffer_index != after.buffer_index) {
+                    report.status = "buffer_id_changed";
+                    break;
+                }
+                if (before.buffer_id != after.buffer_id) {
+                    report.status = "buffer_reallocated";
+                    break;
+                }
+                if (!before.complete || !after.complete) {
+                    report.status = "buffer_bitmap_incomplete";
+                    break;
+                }
+                if (before.page_size != after.page_size) {
+                    report.status = "page_size_changed";
+                    break;
+                }
+                if (before.aligned_start != after.aligned_start || before.aligned_end != after.aligned_end) {
+                    report.status = "address_range_changed";
+                    break;
+                }
+                kv_residency_transition_buffer buffer;
+                buffer.buffer_index = after.buffer_index;
+                buffer.buffer_id = after.buffer_id;
+                buffer.aligned_start = after.aligned_start;
+                buffer.aligned_end = after.aligned_end;
+                buffer.page_size = after.page_size;
+                if (!llama_kv_residency::calculate_transition(before.bitmap, after.bitmap, buffer.counts) ||
+                    !buffer.counts.valid()) {
+                    report.status = "transition_invariant_failed";
+                    break;
+                }
+                report.buffers.push_back(buffer);
+                ranges.push_back({ after.aligned_start, after.aligned_end, after.page_size, &before.bitmap, &after.bitmap });
+            }
+            if (report.status.empty()) {
+                if (!llama_kv_residency::calculate_unique_transition(ranges, report.aggregate) ||
+                    !report.aggregate.valid()) {
+                    report.status = "aggregate_transition_invariant_failed";
+                } else {
+                    report.valid = true;
+                    report.status = "ok";
+                }
+            }
+        }
+    }
+    report.elapsed_ns = kv_residency_elapsed_ns(start);
+    return report;
+}
+
+static bool kv_residency_write_transition(const kv_residency_transition_report & report) {
+    const char * path = kv_residency_env_path("LLAMA_KV_RESIDENCY_TRANSITION_LOG_PATH", "kv_residency_transitions.csv");
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to open KV residency transition log '%s'\n", __func__, path);
+        return false;
+    }
+    if (out.tellp() == 0) {
+        out << "schema_version,comparison_id,interval,request_id,previous_snapshot_id,current_snapshot_id,"
+               "previous_event,current_event,record_type,buffer_index,buffer_id,aligned_start,aligned_end,page_size,"
+               "compared_pages,previous_resident_pages,current_resident_pages,entered_pages,exited_pages,"
+               "stayed_resident_pages,stayed_nonresident_pages,residency_net_change,compare_elapsed_ns,"
+               "retained_bytes,peak_retained_bytes,valid,status\n";
+    }
+
+    auto write_common = [&](const char * record_type) {
+        out << "1," << report.comparison_id << ',' << kv_residency_csv_field(report.interval.c_str()) << ',';
+        if (report.request_id >= 0) {
+            out << report.request_id;
+        }
+        out << ',';
+        if (report.previous_snapshot_id > 0) {
+            out << report.previous_snapshot_id;
+        }
+        out << ',' << report.current_snapshot_id << ',' << kv_residency_csv_field(report.previous_event.c_str()) << ','
+            << kv_residency_csv_field(report.current_event.c_str()) << ',' << record_type << ',';
+    };
+    auto write_counts = [&](const llama_kv_residency::transition_counts & counts) {
+        out << counts.compared_pages << ',' << counts.previous_resident_pages << ',' << counts.current_resident_pages << ','
+            << counts.entered_pages << ',' << counts.exited_pages << ',' << counts.stayed_resident_pages << ','
+            << counts.stayed_nonresident_pages << ','
+            << (int64_t(counts.entered_pages) - int64_t(counts.exited_pages));
+    };
+
+    if (report.valid) {
+        for (const auto & buffer : report.buffers) {
+            write_common("BUFFER");
+            out << buffer.buffer_index << ',' << buffer.buffer_id << ',' << buffer.aligned_start << ','
+                << buffer.aligned_end << ',' << buffer.page_size << ',';
+            write_counts(buffer.counts);
+            out << ',' << report.elapsed_ns << ',' << report.retained_bytes << ',' << report.peak_retained_bytes
+                << ",1," << kv_residency_csv_field("ok") << '\n';
+        }
+    }
+    write_common("AGGREGATE");
+    out << ",,,,,";
+    if (report.valid) {
+        write_counts(report.aggregate);
+        out << ',';
+    } else {
+        out << ",,,,,,,,";
+    }
+    out << report.elapsed_ns << ',' << report.retained_bytes << ',' << report.peak_retained_bytes << ','
+        << (report.valid ? 1 : 0) << ',' << kv_residency_csv_field(report.status.c_str()) << '\n';
+    out.close();
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to write KV residency transition log '%s'\n", __func__, path);
+        return false;
+    }
+    return true;
+}
+
+struct kv_residency_transition_tracker {
+    uint64_t next_comparison_id = 1;
+    uint64_t peak_retained_bytes = 0;
+    std::map<uintptr_t, kv_residency_bitmap_snapshot> init;
+    std::map<std::pair<uintptr_t, int64_t>, kv_residency_bitmap_snapshot> request_start;
+    std::map<std::pair<uintptr_t, int64_t>, kv_residency_bitmap_snapshot> prefill_complete;
+
+    uint64_t retained_bytes() const {
+        uint64_t result = 0;
+        for (const auto & item : init) {
+            result += item.second.bitmap_bytes();
+        }
+        for (const auto & item : request_start) {
+            result += item.second.bitmap_bytes();
+        }
+        for (const auto & item : prefill_complete) {
+            result += item.second.bitmap_bytes();
+        }
+        return result;
+    }
+};
+
 } // namespace
+
+struct llama_kv_repeated_activity_state {
+    struct range {
+        uintptr_t start = 0;
+        uintptr_t end = 0;
+        uint64_t first_page = 0;
+    };
+
+    struct request_session {
+        uintptr_t cache_id = 0;
+        int64_t request_id = -1;
+        int64_t task_id = -1;
+        int64_t slot_id = -1;
+        uint64_t page_size = 0;
+        uint64_t page_count = 0;
+        uint64_t interval_ms = 1000;
+        std::vector<range> ranges;
+        std::unique_ptr<llama_kv_repeated_activity::sampling_worker> worker;
+        std::string completion_status;
+    };
+
+    static llama_kv_repeated_activity::scan_result scan(
+            const std::vector<range> & ranges,
+            uint64_t page_size,
+            uint64_t page_count) {
+        llama_kv_repeated_activity::scan_result result;
+        result.timestamp_ns = phase_now_ns();
+#if !defined(__linux__)
+        (void) ranges;
+        (void) page_size;
+        (void) page_count;
+        result.status = "unsupported_platform";
+#else
+        try {
+            result.bitmap.resize(page_count);
+            constexpr uint64_t chunk_page_limit = 64 * 1024;
+            std::vector<unsigned char> residency(static_cast<size_t>(
+                    std::min<uint64_t>(page_count, chunk_page_limit)));
+            for (const auto & item : ranges) {
+                uintptr_t chunk_start = item.start;
+                uint64_t output_page = item.first_page;
+                while (chunk_start < item.end) {
+                    const uint64_t pages_left = (item.end - chunk_start) / page_size;
+                    const size_t chunk_pages = static_cast<size_t>(
+                            std::min<uint64_t>(pages_left, chunk_page_limit));
+                    const size_t chunk_bytes = chunk_pages * static_cast<size_t>(page_size);
+                    errno = 0;
+                    const auto mincore_started = std::chrono::steady_clock::now();
+                    if (mincore(reinterpret_cast<void *>(chunk_start), chunk_bytes, residency.data()) != 0) {
+                        result.mincore_elapsed_ns += kv_residency_elapsed_ns(mincore_started);
+                        result.error_no = errno;
+                        result.status = "mincore_failed";
+                        return result;
+                    }
+                    result.mincore_elapsed_ns += kv_residency_elapsed_ns(mincore_started);
+                    for (size_t page = 0; page < chunk_pages; ++page) {
+                        result.bitmap.set(output_page + page, (residency[page] & 1U) != 0);
+                    }
+                    output_page += chunk_pages;
+                    chunk_start += chunk_bytes;
+                }
+            }
+            result.valid = true;
+            result.status = "ok";
+        } catch (const std::bad_alloc &) {
+            result.error_no = ENOMEM;
+            result.status = "allocation_failed";
+        }
+#endif
+        return result;
+    }
+
+    static const char * path(const char * name, const char * fallback) {
+        const char * configured = std::getenv(name);
+        return configured && configured[0] ? configured : fallback;
+    }
+
+    static std::mutex & output_mutex() {
+        static std::mutex mutex;
+        return mutex;
+    }
+
+    static uintptr_t page_address(const request_session & session, uint64_t page_index) {
+        for (const auto & item : session.ranges) {
+            const uint64_t pages = (item.end - item.start) / session.page_size;
+            if (page_index >= item.first_page && page_index < item.first_page + pages) {
+                return item.start + (page_index - item.first_page) * session.page_size;
+            }
+        }
+        return 0;
+    }
+
+    static void write_results(const request_session & session) {
+        if (!session.worker) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(output_mutex());
+        const auto & observations = session.worker->observations();
+        const auto totals = observations.calculate_summary();
+        const char * result_status = session.completion_status.c_str();
+        if (session.completion_status == "ok" && totals.valid_sample_count == 0) {
+            result_status = "no_valid_samples";
+        } else if (session.completion_status == "ok" && totals.failed_sample_count > 0) {
+            result_status = "partial_failure";
+        }
+
+        const char * samples_path = path(
+                "LLAMA_KV_REPEATED_ACTIVITY_SAMPLES_PATH", "kv_repeated_activity_samples.csv");
+        std::ofstream samples(samples_path, std::ios::app);
+        if (samples) {
+            if (samples.tellp() == 0) {
+                samples << "schema_version,cache_id,request_id,task_id,slot_id,sample_id,ts_ns,clock_domain,"
+                           "event,phase,configured_interval_ms,actual_interval_ns,mincore_elapsed_ns,page_size,"
+                           "observed_pages,resident_pages,entered_pages,exited_pages,observed_transitions,valid,status,errno\n";
+            }
+            for (const auto & item : observations.samples()) {
+                samples << "1," << session.cache_id << ',' << session.request_id << ',' << session.task_id << ','
+                    << session.slot_id << ',' << item.sample_id << ',' << item.timestamp_ns << ",pi_monotonic_raw,"
+                    << kv_residency_csv_field(item.event.c_str()) << ','
+                    << kv_residency_csv_field(item.phase.c_str()) << ',' << session.interval_ms << ',';
+                if (item.has_interval) {
+                    samples << item.actual_interval_ns;
+                }
+                samples << ',' << item.mincore_elapsed_ns << ',' << session.page_size << ',' << session.page_count << ',';
+                if (item.valid) {
+                    samples << item.resident_pages;
+                }
+                samples << ',';
+                if (item.has_transition) {
+                    samples << item.transition.entered_pages;
+                }
+                samples << ',';
+                if (item.has_transition) {
+                    samples << item.transition.exited_pages;
+                }
+                samples << ',';
+                if (item.has_transition) {
+                    samples << item.transition.entered_pages + item.transition.exited_pages;
+                }
+                samples << ',' << (item.valid ? 1 : 0) << ','
+                    << kv_residency_csv_field(item.status.c_str()) << ',' << item.error_no << '\n';
+            }
+            if (!samples) {
+                LLAMA_LOG_ERROR("%s: failed to write '%s'\n", __func__, samples_path);
+            }
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to open '%s'\n", __func__, samples_path);
+        }
+
+        const char * summary_path = path(
+                "LLAMA_KV_REPEATED_ACTIVITY_SUMMARY_PATH", "kv_repeated_activity_summary.csv");
+        std::ofstream summary(summary_path, std::ios::app);
+        if (summary) {
+            if (summary.tellp() == 0) {
+                summary << "schema_version,cache_id,request_id,task_id,slot_id,start_ts_ns,end_ts_ns,duration_ns,"
+                           "configured_interval_ms,page_size,observed_pages,sample_count,valid_sample_count,"
+                           "failed_sample_count,total_entered_pages,total_exited_pages,total_observed_transitions,"
+                           "pages_with_observed_transition,pages_with_repeated_transition,repeat_transition_excess,"
+                           "max_observed_transitions_per_page,mean_mincore_elapsed_ns,max_mincore_elapsed_ns,"
+                           "interpretation,status\n";
+            }
+            const auto & rows = observations.samples();
+            const uint64_t start_ts = rows.empty() ? 0 : rows.front().timestamp_ns;
+            const uint64_t end_ts = rows.empty() ? 0 : rows.back().timestamp_ns;
+            summary << "1," << session.cache_id << ',' << session.request_id << ',' << session.task_id << ','
+                << session.slot_id << ',' << start_ts << ',' << end_ts << ','
+                << (end_ts >= start_ts ? end_ts - start_ts : 0) << ',' << session.interval_ms << ','
+                << session.page_size << ',' << session.page_count << ',' << totals.sample_count << ','
+                << totals.valid_sample_count << ',' << totals.failed_sample_count << ','
+                << totals.total_entered_pages << ',' << totals.total_exited_pages << ','
+                << totals.total_observed_transitions << ',' << totals.pages_with_observed_transition << ','
+                << totals.pages_with_repeated_transition << ',' << totals.repeat_transition_excess << ','
+                << totals.max_observed_transitions_per_page << ',';
+            if (totals.sample_count > 0) {
+                summary << totals.mincore_elapsed_ns_total / totals.sample_count;
+            }
+            summary << ',' << totals.max_mincore_elapsed_ns << ",observed_transition_lower_bound,"
+                << kv_residency_csv_field(result_status) << '\n';
+            if (!summary) {
+                LLAMA_LOG_ERROR("%s: failed to write '%s'\n", __func__, summary_path);
+            }
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to open '%s'\n", __func__, summary_path);
+        }
+
+        const char * pages_path = path(
+                "LLAMA_KV_REPEATED_ACTIVITY_PAGES_PATH", "kv_repeated_activity_pages.csv");
+        std::ofstream pages(pages_path, std::ios::app);
+        if (pages) {
+            if (pages.tellp() == 0) {
+                pages << "schema_version,cache_id,request_id,task_id,slot_id,page_index,page_address,page_size,"
+                         "initial_resident,final_resident,observed_entered,observed_exited,observed_transitions,"
+                         "repeated_transition\n";
+            }
+            const auto & page_stats = observations.page_transitions();
+            for (uint64_t page = 0; page < page_stats.size(); ++page) {
+                const auto & item = page_stats[static_cast<size_t>(page)];
+                if (item.total() == 0) {
+                    continue;
+                }
+                pages << "1," << session.cache_id << ',' << session.request_id << ',' << session.task_id << ','
+                    << session.slot_id << ',' << page << ',' << page_address(session, page) << ','
+                    << session.page_size << ',' << observations.initial_bitmap().get(page) << ','
+                    << observations.final_bitmap().get(page) << ',' << item.entered << ',' << item.exited << ','
+                    << item.total() << ',' << (item.total() >= 2 ? 1 : 0) << '\n';
+            }
+            if (!pages) {
+                LLAMA_LOG_ERROR("%s: failed to write '%s'\n", __func__, pages_path);
+            }
+        } else {
+            LLAMA_LOG_ERROR("%s: failed to open '%s'\n", __func__, pages_path);
+        }
+    }
+
+    void start(
+            uintptr_t cache_id,
+            const phase_fields & fields,
+            std::vector<range> ranges,
+            uint64_t page_size,
+            uint64_t page_count) {
+        if (fields.request_id < 0 || ranges.empty() || page_count == 0) {
+            LLAMA_LOG_ERROR("%s: cannot start P5-2C sampler without request id and KV page ranges\n", __func__);
+            return;
+        }
+        auto previous = sessions.find(fields.request_id);
+        if (previous != sessions.end()) {
+            previous->second->worker->stop_without_sample();
+            previous->second->completion_status = "replaced_before_decode_complete";
+            write_results(*previous->second);
+            sessions.erase(previous);
+        }
+
+        auto session = std::make_unique<request_session>();
+        session->cache_id = cache_id;
+        session->request_id = fields.request_id;
+        session->task_id = fields.task_id;
+        session->slot_id = fields.slot_id;
+        session->page_size = page_size;
+        session->page_count = page_count;
+        session->interval_ms = llama_kv_repeated_activity::parse_interval_ms(
+                std::getenv("LLAMA_KV_REPEATED_ACTIVITY_INTERVAL_MS"));
+        session->ranges = std::move(ranges);
+        const auto scan_ranges = session->ranges;
+        session->worker = std::make_unique<llama_kv_repeated_activity::sampling_worker>(
+                page_count, session->interval_ms,
+                [scan_ranges, page_size, page_count] {
+                    return scan(scan_ranges, page_size, page_count);
+                });
+        if (!session->worker->start("REQUEST_START", "PREFILL")) {
+            session->completion_status = "worker_start_failed";
+            write_results(*session);
+            return;
+        }
+        sessions.emplace(fields.request_id, std::move(session));
+    }
+
+    void prefill_complete(int64_t request_id) {
+        const auto found = sessions.find(request_id);
+        if (found != sessions.end()) {
+            found->second->worker->boundary("PREFILL_COMPLETE", "PREFILL", "DECODE");
+        }
+    }
+
+    void decode_complete(int64_t request_id) {
+        const auto found = sessions.find(request_id);
+        if (found == sessions.end()) {
+            return;
+        }
+        found->second->worker->stop("DECODE_COMPLETE", "DECODE");
+        found->second->completion_status = "ok";
+        write_results(*found->second);
+        sessions.erase(found);
+    }
+
+    void stop_all() {
+        for (auto & item : sessions) {
+            item.second->worker->stop_without_sample();
+            item.second->completion_status = "stopped_before_decode_complete";
+            write_results(*item.second);
+        }
+        sessions.clear();
+    }
+
+    ~llama_kv_repeated_activity_state() {
+        stop_all();
+    }
+
+    std::map<int64_t, std::unique_ptr<request_session>> sessions;
+};
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -347,6 +1049,17 @@ llama_kv_cache::llama_kv_cache(
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
+    if (llama_kv_page_coverage_enabled()) {
+        for (const auto & layer : layers) {
+            if (layer.k) {
+                ggml_cpu_kv_coverage_register_tensor(layer.k, layer.il, GGML_CPU_KV_COVERAGE_TENSOR_K);
+            }
+            if (layer.v) {
+                ggml_cpu_kv_coverage_register_tensor(layer.v, layer.il, GGML_CPU_KV_COVERAGE_TENSOR_V);
+            }
+        }
+    }
+
     {
         const size_t memory_size_k = size_k_bytes();
         const size_t memory_size_v = size_v_bytes();
@@ -417,6 +1130,23 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    // The P5-2C worker only holds copied virtual ranges, so it must be joined
+    // before ctxs_bufs releases the backing KV allocations.
+    repeated_activity.reset();
+    if (!llama_kv_page_coverage_enabled()) {
+        return;
+    }
+    for (const auto & layer : layers) {
+        if (layer.k) {
+            ggml_cpu_kv_coverage_unregister_tensor(layer.k);
+        }
+        if (layer.v) {
+            ggml_cpu_kv_coverage_unregister_tensor(layer.v);
+        }
+    }
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -1272,20 +2002,32 @@ void llama_kv_cache::log_residency_snapshot(
         const char * event,
         const char * stage,
         const phase_fields & fields) const {
-    const char * enabled = std::getenv("LLAMA_KV_RESIDENCY_DIAGNOSTIC");
-    if (!enabled || enabled[0] != '1' || enabled[1] != '\0') {
+    if (!kv_residency_env_enabled("LLAMA_KV_RESIDENCY_DIAGNOSTIC")) {
         return;
     }
 
     static std::mutex log_mutex;
     static uint64_t next_snapshot_id = 1;
+    static kv_residency_transition_tracker transition_tracker;
     std::lock_guard<std::mutex> lock(log_mutex);
 
     const auto snapshot_start = std::chrono::steady_clock::now();
     const uint64_t timestamp_ns = phase_now_ns();
     const uint64_t snapshot_id = next_snapshot_id++;
+    const bool transition_enabled = kv_residency_env_enabled("LLAMA_KV_RESIDENCY_TRANSITION_DIAGNOSTIC");
     std::vector<kv_residency_row> rows;
     rows.reserve(ctxs_bufs.size());
+    kv_residency_bitmap_snapshot bitmap_snapshot;
+    if (transition_enabled) {
+        bitmap_snapshot.snapshot_id = snapshot_id;
+        bitmap_snapshot.timestamp_ns = timestamp_ns;
+        bitmap_snapshot.event = event ? event : "";
+        bitmap_snapshot.stage = stage ? stage : "";
+        bitmap_snapshot.request_id = fields.request_id;
+        bitmap_snapshot.task_id = fields.task_id;
+        bitmap_snapshot.slot_id = fields.slot_id;
+        bitmap_snapshot.buffers.reserve(ctxs_bufs.size());
+    }
 
     uint64_t page_size = 0;
 #if defined(__linux__)
@@ -1307,37 +2049,19 @@ void llama_kv_cache::log_residency_snapshot(
     bool any_scanned = false;
 
 #if defined(__linux__)
-    using page_range = std::pair<uintptr_t, uintptr_t>;
-    std::vector<page_range> covered_ranges;
-    auto add_covered_range = [&](uintptr_t start, uintptr_t end) {
-        std::vector<page_range> merged;
-        merged.reserve(covered_ranges.size() + 1);
-        bool inserted = false;
-        for (const auto & range : covered_ranges) {
-            if (range.second < start) {
-                merged.push_back(range);
-            } else if (end < range.first) {
-                if (!inserted) {
-                    merged.emplace_back(start, end);
-                    inserted = true;
-                }
-                merged.push_back(range);
-            } else {
-                start = std::min(start, range.first);
-                end = std::max(end, range.second);
-            }
-        }
-        if (!inserted) {
-            merged.emplace_back(start, end);
-        }
-        covered_ranges.swap(merged);
-    };
+    std::vector<llama_kv_residency::page_range> covered_ranges;
 #endif
 
     for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
         const auto buffer_start = std::chrono::steady_clock::now();
         kv_residency_row row;
         row.buffer_index = i;
+        kv_residency_bitmap_row bitmap_row;
+        bitmap_row.buffer_index = i;
+#if defined(__linux__)
+        std::vector<llama_kv_residency::page_range> bitmap_covered_ranges;
+        bool bitmap_ready = false;
+#endif
 
         ggml_backend_buffer_t buffer = ctxs_bufs[i].second.get();
         if (!buffer) {
@@ -1345,6 +2069,11 @@ void llama_kv_cache::log_residency_snapshot(
             row.status = "null_buffer";
             any_unmeasured = true;
             row.elapsed_ns = kv_residency_elapsed_ns(buffer_start);
+            if (transition_enabled) {
+                bitmap_row.backend = row.backend;
+                bitmap_row.status = row.status;
+                bitmap_snapshot.buffers.push_back(std::move(bitmap_row));
+            }
             rows.push_back(std::move(row));
             continue;
         }
@@ -1352,6 +2081,12 @@ void llama_kv_cache::log_residency_snapshot(
         row.backend = ggml_backend_buffer_name(buffer);
         const size_t allocated_bytes = ggml_backend_buffer_get_size(buffer);
         row.allocated_bytes = allocated_bytes;
+        if (transition_enabled) {
+            bitmap_row.buffer_id = reinterpret_cast<uintptr_t>(buffer);
+            bitmap_row.backend = row.backend;
+            bitmap_row.allocated_bytes = allocated_bytes;
+            bitmap_row.page_size = page_size;
+        }
         if (allocated_bytes > std::numeric_limits<uint64_t>::max() - total_allocated_bytes) {
             total_allocated_overflow = true;
         } else {
@@ -1392,113 +2127,144 @@ void llama_kv_cache::log_residency_snapshot(
                 } else {
                     const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
                     const uintptr_t ps = static_cast<uintptr_t>(page_size);
-                    const uintptr_t max_addr = std::numeric_limits<uintptr_t>::max();
+                    uintptr_t aligned_start = 0;
+                    uintptr_t aligned_end = 0;
+                    const auto range_status = llama_kv_residency::align_range(
+                            base_addr, allocated_bytes, ps, aligned_start, aligned_end);
 
-                    if (allocated_bytes > max_addr - base_addr) {
+                    if (range_status == llama_kv_residency::range_status::address_overflow) {
                         row.status = "address_overflow";
                         any_unmeasured = true;
+                    } else if (range_status == llama_kv_residency::range_status::alignment_overflow) {
+                        row.status = "alignment_overflow";
+                        any_unmeasured = true;
                     } else {
-                        const uintptr_t allocation_end = base_addr + allocated_bytes;
-                        const uintptr_t aligned_start = (base_addr / ps) * ps;
-                        if (allocation_end > max_addr - (ps - 1)) {
-                            row.status = "alignment_overflow";
+                        row.aligned_start = aligned_start;
+                        row.aligned_end = aligned_end;
+                        row.has_range = true;
+                        if (transition_enabled) {
+                            bitmap_row.aligned_start = aligned_start;
+                            bitmap_row.aligned_end = aligned_end;
+                        }
+
+                        if (range_status == llama_kv_residency::range_status::empty) {
+                            row.status = "empty_aligned_range";
                             any_unmeasured = true;
                         } else {
-                            const uintptr_t aligned_end = ((allocation_end + ps - 1) / ps) * ps;
-                            row.aligned_start = aligned_start;
-                            row.aligned_end = aligned_end;
-                            row.has_range = true;
-
-                            if (aligned_end <= aligned_start) {
-                                row.status = "empty_aligned_range";
-                                any_unmeasured = true;
-                            } else {
-                                const uint64_t full_pages = (aligned_end - aligned_start) / ps;
-                                std::vector<page_range> uncovered;
-                                uintptr_t cursor = aligned_start;
-                                for (const auto & range : covered_ranges) {
-                                    if (range.second <= cursor) {
-                                        continue;
-                                    }
-                                    if (range.first >= aligned_end) {
-                                        break;
-                                    }
-                                    if (range.first > cursor) {
-                                        uncovered.emplace_back(cursor, std::min(range.first, aligned_end));
-                                    }
-                                    cursor = std::max(cursor, range.second);
-                                    if (cursor >= aligned_end) {
-                                        break;
-                                    }
-                                }
-                                if (cursor < aligned_end) {
-                                    uncovered.emplace_back(cursor, aligned_end);
-                                }
-
-                                uint64_t uncovered_pages = 0;
-                                for (const auto & range : uncovered) {
-                                    uncovered_pages += (range.second - range.first) / ps;
-                                }
-                                row.overlap_pages = full_pages - uncovered_pages;
-                                total_overlap_pages += row.overlap_pages;
-
-                                constexpr size_t mincore_chunk_pages = 64 * 1024;
-                                std::vector<unsigned char> residency;
+                            const uint64_t full_pages = (aligned_end - aligned_start) / ps;
+                            const auto uncovered = llama_kv_residency::uncovered_ranges(
+                                    covered_ranges, aligned_start, aligned_end);
+                            if (transition_enabled) {
                                 try {
-                                    residency.resize(static_cast<size_t>(std::min<uint64_t>(
-                                            uncovered_pages, mincore_chunk_pages)));
-                                } catch (const std::bad_alloc &) {
-                                    row.status = "residency_vector_allocation_failed";
-                                    row.error_no = ENOMEM;
-                                    any_unmeasured = true;
-                                }
-
-                                bool scan_failed = !row.status.empty();
-                                for (const auto & range : uncovered) {
-                                    uintptr_t chunk_start = range.first;
-                                    while (!scan_failed && chunk_start < range.second) {
-                                        const uint64_t pages_left = (range.second - chunk_start) / ps;
-                                        const size_t chunk_pages = static_cast<size_t>(
-                                                std::min<uint64_t>(pages_left, mincore_chunk_pages));
-                                        const size_t chunk_bytes = chunk_pages * static_cast<size_t>(ps);
-
-                                        errno = 0;
-                                        if (mincore(reinterpret_cast<void *>(chunk_start), chunk_bytes, residency.data()) != 0) {
-                                            row.status = "mincore_failed";
-                                            row.error_no = errno;
-                                            any_unmeasured = true;
-                                            scan_failed = true;
-                                            break;
+                                    bitmap_row.bitmap.resize(full_pages);
+                                    bitmap_ready = true;
+                                    for (const auto & previous : bitmap_snapshot.buffers) {
+                                        if (!previous.complete || previous.page_size != page_size) {
+                                            continue;
                                         }
-
-                                        uint64_t resident = 0;
-                                        for (size_t page = 0; page < chunk_pages; ++page) {
-                                            resident += (residency[page] & 1U) != 0;
+                                        const uintptr_t copy_start = std::max(aligned_start, previous.aligned_start);
+                                        const uintptr_t copy_end = std::min(aligned_end, previous.aligned_end);
+                                        if (copy_start >= copy_end) {
+                                            continue;
                                         }
-                                        row.scanned_pages += chunk_pages;
-                                        row.resident_pages += resident;
-                                        total_scanned_pages += chunk_pages;
-                                        total_resident_pages += resident;
-                                        any_scanned = true;
-
-                                        const uintptr_t chunk_end = chunk_start + chunk_bytes;
-                                        add_covered_range(chunk_start, chunk_end);
-                                        chunk_start = chunk_end;
+                                        for (uintptr_t address = copy_start; address < copy_end; address += ps) {
+                                            const uint64_t source_page = (address - previous.aligned_start) / ps;
+                                            const uint64_t target_page = (address - aligned_start) / ps;
+                                            bitmap_row.bitmap.set(target_page, previous.bitmap.get(source_page));
+                                        }
+                                        llama_kv_residency::add_covered_range(bitmap_covered_ranges, copy_start, copy_end);
                                     }
-                                    if (scan_failed) {
+                                } catch (const std::bad_alloc &) {
+                                    bitmap_ready = false;
+                                    bitmap_row.status = "bitmap_allocation_failed";
+                                    bitmap_row.error_no = ENOMEM;
+                                }
+                            }
+
+                            uint64_t uncovered_pages = 0;
+                            for (const auto & range : uncovered) {
+                                uncovered_pages += (range.second - range.first) / ps;
+                            }
+                            row.overlap_pages = full_pages - uncovered_pages;
+                            total_overlap_pages += row.overlap_pages;
+
+                            constexpr size_t mincore_chunk_pages = 64 * 1024;
+                            std::vector<unsigned char> residency;
+                            try {
+                                residency.resize(static_cast<size_t>(std::min<uint64_t>(
+                                        uncovered_pages, mincore_chunk_pages)));
+                            } catch (const std::bad_alloc &) {
+                                row.status = "residency_vector_allocation_failed";
+                                row.error_no = ENOMEM;
+                                any_unmeasured = true;
+                            }
+
+                            bool scan_failed = !row.status.empty();
+                            for (const auto & range : uncovered) {
+                                uintptr_t chunk_start = range.first;
+                                while (!scan_failed && chunk_start < range.second) {
+                                    const uint64_t pages_left = (range.second - chunk_start) / ps;
+                                    const size_t chunk_pages = static_cast<size_t>(
+                                            std::min<uint64_t>(pages_left, mincore_chunk_pages));
+                                    const size_t chunk_bytes = chunk_pages * static_cast<size_t>(ps);
+
+                                    errno = 0;
+                                    if (mincore(reinterpret_cast<void *>(chunk_start), chunk_bytes, residency.data()) != 0) {
+                                        row.status = "mincore_failed";
+                                        row.error_no = errno;
+                                        any_unmeasured = true;
+                                        scan_failed = true;
                                         break;
                                     }
-                                }
 
-                                row.has_counts = row.scanned_pages > 0;
-                                if (!scan_failed) {
-                                    if (uncovered_pages == 0) {
-                                        row.status = "overlap_deduplicated";
-                                    } else if (row.overlap_pages > 0) {
-                                        row.status = "ok_overlap_deduplicated";
-                                    } else {
-                                        row.status = "ok";
+                                    uint64_t resident = 0;
+                                    for (size_t page = 0; page < chunk_pages; ++page) {
+                                        const bool is_resident = (residency[page] & 1U) != 0;
+                                        resident += is_resident;
+                                        if (transition_enabled && bitmap_ready) {
+                                            const uint64_t target_page = (chunk_start - aligned_start) / ps + page;
+                                            bitmap_row.bitmap.set(target_page, is_resident);
+                                        }
                                     }
+                                    row.scanned_pages += chunk_pages;
+                                    row.resident_pages += resident;
+                                    total_scanned_pages += chunk_pages;
+                                    total_resident_pages += resident;
+                                    any_scanned = true;
+
+                                    const uintptr_t chunk_end = chunk_start + chunk_bytes;
+                                    llama_kv_residency::add_covered_range(covered_ranges, chunk_start, chunk_end);
+                                    if (transition_enabled && bitmap_ready) {
+                                        llama_kv_residency::add_covered_range(bitmap_covered_ranges, chunk_start, chunk_end);
+                                    }
+                                    chunk_start = chunk_end;
+                                }
+                                if (scan_failed) {
+                                    break;
+                                }
+                            }
+
+                            row.has_counts = row.scanned_pages > 0;
+                            if (!scan_failed) {
+                                if (uncovered_pages == 0) {
+                                    row.status = "overlap_deduplicated";
+                                } else if (row.overlap_pages > 0) {
+                                    row.status = "ok_overlap_deduplicated";
+                                } else {
+                                    row.status = "ok";
+                                }
+                            }
+
+                            if (transition_enabled) {
+                                const bool bitmap_has_gaps = bitmap_ready && !llama_kv_residency::uncovered_ranges(
+                                        bitmap_covered_ranges, aligned_start, aligned_end).empty();
+                                bitmap_row.complete = bitmap_ready && !scan_failed && !bitmap_has_gaps;
+                                if (bitmap_row.complete) {
+                                    bitmap_row.resident_pages = kv_residency_count_bits(bitmap_row.bitmap);
+                                    bitmap_row.status = "ok";
+                                } else if (bitmap_row.status.empty()) {
+                                    bitmap_row.status = scan_failed ? row.status : "bitmap_coverage_incomplete";
+                                    bitmap_row.error_no = row.error_no;
                                 }
                             }
                         }
@@ -1509,6 +2275,13 @@ void llama_kv_cache::log_residency_snapshot(
         }
 
         row.elapsed_ns = kv_residency_elapsed_ns(buffer_start);
+        if (transition_enabled) {
+            if (bitmap_row.status.empty()) {
+                bitmap_row.status = row.status;
+                bitmap_row.error_no = row.error_no;
+            }
+            bitmap_snapshot.buffers.push_back(std::move(bitmap_row));
+        }
         rows.push_back(std::move(row));
     }
 
@@ -1529,6 +2302,86 @@ void llama_kv_cache::log_residency_snapshot(
         aggregate.status = "ok";
     }
     aggregate.elapsed_ns = kv_residency_elapsed_ns(snapshot_start);
+
+    if (transition_enabled) {
+        size_t complete_buffers = 0;
+        for (const auto & buffer : bitmap_snapshot.buffers) {
+            complete_buffers += buffer.complete;
+        }
+        bitmap_snapshot.complete = !bitmap_snapshot.buffers.empty() &&
+            complete_buffers == bitmap_snapshot.buffers.size();
+        bitmap_snapshot.status = llama_kv_residency::snapshot_status(
+                bitmap_snapshot.buffers.size(), complete_buffers);
+        bitmap_snapshot.snapshot_elapsed_ns = kv_residency_elapsed_ns(snapshot_start);
+
+        const auto persist_start = std::chrono::steady_clock::now();
+        kv_residency_persist_bitmaps(bitmap_snapshot);
+        bitmap_snapshot.persist_elapsed_ns = kv_residency_elapsed_ns(persist_start);
+        if (!kv_residency_write_bitmap_index(bitmap_snapshot)) {
+            bitmap_snapshot.complete = false;
+            bitmap_snapshot.status = "bitmap_index_write_failed";
+        }
+
+        const uintptr_t cache_id = reinterpret_cast<uintptr_t>(this);
+        if (bitmap_snapshot.stage == "INIT") {
+            if (bitmap_snapshot.complete) {
+                transition_tracker.init[cache_id] = std::move(bitmap_snapshot);
+                transition_tracker.peak_retained_bytes = std::max(
+                        transition_tracker.peak_retained_bytes, transition_tracker.retained_bytes());
+            }
+        } else if (bitmap_snapshot.stage == "REQUEST_START" ||
+                   bitmap_snapshot.stage == "PREFILL_COMPLETE" ||
+                   bitmap_snapshot.stage == "DECODE_COMPLETE") {
+            const auto request_key = std::make_pair(cache_id, bitmap_snapshot.request_id);
+            const kv_residency_bitmap_snapshot * previous = nullptr;
+            const char * interval = "";
+            if (bitmap_snapshot.stage == "REQUEST_START") {
+                const auto found = transition_tracker.init.find(cache_id);
+                previous = found != transition_tracker.init.end() ? &found->second : nullptr;
+                interval = "INIT_TO_REQUEST_START";
+            } else if (bitmap_snapshot.stage == "PREFILL_COMPLETE") {
+                const auto found = transition_tracker.request_start.find(request_key);
+                previous = found != transition_tracker.request_start.end() ? &found->second : nullptr;
+                interval = "REQUEST_START_TO_PREFILL_COMPLETE";
+            } else {
+                const auto found = transition_tracker.prefill_complete.find(request_key);
+                previous = found != transition_tracker.prefill_complete.end() ? &found->second : nullptr;
+                interval = "PREFILL_COMPLETE_TO_DECODE_COMPLETE";
+            }
+
+            auto report = kv_residency_compare_snapshots(
+                    transition_tracker.next_comparison_id++, interval, previous, bitmap_snapshot);
+            if (bitmap_snapshot.request_id < 0) {
+                report.valid = false;
+                report.status = "missing_request_id";
+                report.buffers.clear();
+                report.aggregate = {};
+            }
+
+            if (bitmap_snapshot.stage == "REQUEST_START") {
+                if (bitmap_snapshot.complete && bitmap_snapshot.request_id >= 0) {
+                    transition_tracker.request_start[request_key] = std::move(bitmap_snapshot);
+                } else {
+                    transition_tracker.request_start.erase(request_key);
+                }
+            } else if (bitmap_snapshot.stage == "PREFILL_COMPLETE") {
+                transition_tracker.request_start.erase(request_key);
+                if (bitmap_snapshot.complete && bitmap_snapshot.request_id >= 0) {
+                    transition_tracker.prefill_complete[request_key] = std::move(bitmap_snapshot);
+                } else {
+                    transition_tracker.prefill_complete.erase(request_key);
+                }
+            } else {
+                transition_tracker.prefill_complete.erase(request_key);
+            }
+
+            report.retained_bytes = transition_tracker.retained_bytes();
+            transition_tracker.peak_retained_bytes = std::max(
+                    transition_tracker.peak_retained_bytes, report.retained_bytes);
+            report.peak_retained_bytes = transition_tracker.peak_retained_bytes;
+            kv_residency_write_transition(report);
+        }
+    }
 
     const char * path_env = std::getenv("LLAMA_KV_RESIDENCY_LOG_PATH");
     const char * path = path_env && path_env[0] ? path_env : "kv_residency.csv";
@@ -1607,6 +2460,308 @@ void llama_kv_cache::log_residency_snapshot(
     out.close();
     if (!out) {
         LLAMA_LOG_ERROR("%s: failed to write KV residency log '%s'\n", __func__, path);
+    }
+}
+
+void llama_kv_cache::repeated_activity_event(
+        const char * event,
+        const char * stage,
+        const phase_fields & fields) const {
+    (void) event;
+    if (!kv_residency_env_enabled("LLAMA_KV_REPEATED_ACTIVITY_DIAGNOSTIC") || !stage) {
+        return;
+    }
+    if (std::strcmp(stage, "PREFILL_COMPLETE") == 0) {
+        if (repeated_activity) {
+            repeated_activity->prefill_complete(fields.request_id);
+        }
+        return;
+    }
+    if (std::strcmp(stage, "DECODE_COMPLETE") == 0) {
+        if (repeated_activity) {
+            repeated_activity->decode_complete(fields.request_id);
+        }
+        return;
+    }
+    if (std::strcmp(stage, "REQUEST_START") != 0) {
+        return;
+    }
+
+#if !defined(__linux__)
+    LLAMA_LOG_ERROR("%s: P5-2C repeated activity sampling is only available on Linux\n", __func__);
+#else
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    if (system_page_size <= 0 || hparams.no_alloc) {
+        LLAMA_LOG_ERROR("%s: P5-2C sampler cannot resolve allocated KV pages\n", __func__);
+        return;
+    }
+    const uint64_t page_size = static_cast<uint64_t>(system_page_size);
+    std::vector<llama_kv_residency::page_range> covered;
+    bool skipped_buffer = false;
+    for (const auto & context_buffer : ctxs_bufs) {
+        ggml_backend_buffer_t buffer = context_buffer.second.get();
+        if (!buffer || !ggml_backend_buffer_is_host(buffer)) {
+            skipped_buffer = true;
+            continue;
+        }
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+        ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+        const bool is_cpu_buffer = buft == ggml_backend_cpu_buffer_type() ||
+            (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU);
+        void * base = ggml_backend_buffer_get_base(buffer);
+        const size_t allocated_bytes = ggml_backend_buffer_get_size(buffer);
+        if (!is_cpu_buffer || !base || allocated_bytes == 0) {
+            skipped_buffer = true;
+            continue;
+        }
+        uintptr_t aligned_start = 0;
+        uintptr_t aligned_end = 0;
+        if (llama_kv_residency::align_range(
+                reinterpret_cast<uintptr_t>(base), allocated_bytes,
+                static_cast<uintptr_t>(page_size), aligned_start, aligned_end) !=
+                llama_kv_residency::range_status::ok) {
+            skipped_buffer = true;
+            continue;
+        }
+        llama_kv_residency::add_covered_range(covered, aligned_start, aligned_end);
+    }
+    if (covered.empty()) {
+        LLAMA_LOG_ERROR("%s: P5-2C sampler found no scannable KV buffer ranges\n", __func__);
+        return;
+    }
+    if (skipped_buffer) {
+        LLAMA_LOG_WARN("%s: P5-2C sampler skipped at least one non-scannable KV buffer\n", __func__);
+    }
+
+    std::vector<llama_kv_repeated_activity_state::range> ranges;
+    ranges.reserve(covered.size());
+    uint64_t page_count = 0;
+    for (const auto & item : covered) {
+        const uint64_t pages = (item.second - item.first) / page_size;
+        if (pages > std::numeric_limits<uint64_t>::max() - page_count) {
+            LLAMA_LOG_ERROR("%s: P5-2C KV page count overflow\n", __func__);
+            return;
+        }
+        ranges.push_back({ item.first, item.second, page_count });
+        page_count += pages;
+    }
+    if (!repeated_activity) {
+        repeated_activity = std::make_unique<llama_kv_repeated_activity_state>();
+    }
+    repeated_activity->start(
+            reinterpret_cast<uintptr_t>(this), fields, std::move(ranges), page_size, page_count);
+#endif
+}
+
+void llama_kv_cache::log_vma_snapshot(
+        const char * event,
+        const char * stage,
+        const phase_fields & fields) const {
+    if (!llama_kv_vma::enabled_value(std::getenv("LLAMA_KV_VMA_DIAGNOSTIC"))) {
+        return;
+    }
+
+    static std::mutex log_mutex;
+    static uint64_t next_snapshot_id = 1;
+    std::lock_guard<std::mutex> lock(log_mutex);
+
+    const auto snapshot_start = std::chrono::steady_clock::now();
+    const uint64_t timestamp_ns = phase_now_ns();
+    const uint64_t snapshot_id = next_snapshot_id++;
+    std::vector<llama_kv_vma::mapping> mappings;
+    bool maps_available = false;
+    bool maps_complete = false;
+    int maps_error_no = 0;
+    uint64_t page_size = 0;
+
+#if defined(__linux__)
+    errno = 0;
+    std::ifstream maps("/proc/self/maps");
+    if (maps) {
+        mappings = llama_kv_vma::parse_maps(maps, maps_complete);
+        maps_complete = maps_complete && !maps.bad();
+        maps_available = true;
+    } else {
+        maps_error_no = errno;
+    }
+
+    const long system_page_size = sysconf(_SC_PAGESIZE);
+    if (system_page_size > 0) {
+        page_size = static_cast<uint64_t>(system_page_size);
+    }
+#endif
+
+    std::vector<kv_vma_buffer_row> rows;
+    rows.reserve(ctxs_bufs.size());
+    for (size_t i = 0; i < ctxs_bufs.size(); ++i) {
+        kv_vma_buffer_row row;
+        row.buffer_index = i;
+        row.page_size = page_size;
+        ggml_backend_buffer_t buffer = ctxs_bufs[i].second.get();
+        if (!buffer) {
+            row.backend = "UNKNOWN";
+            row.status = "null_buffer";
+            rows.push_back(std::move(row));
+            continue;
+        }
+
+        row.buffer_id = reinterpret_cast<uintptr_t>(buffer);
+        row.backend = ggml_backend_buffer_name(buffer);
+        row.allocated_bytes = ggml_backend_buffer_get_size(buffer);
+        if (hparams.no_alloc) {
+            row.status = "no_alloc";
+        } else if (row.allocated_bytes == 0) {
+            row.status = "zero_size";
+#if !defined(__linux__)
+        } else {
+            row.status = "unsupported_platform";
+#else
+        } else if (page_size == 0 || page_size > std::numeric_limits<uintptr_t>::max()) {
+            row.status = "page_size_unavailable";
+        } else if (!ggml_backend_buffer_is_host(buffer)) {
+            row.status = "non_host_backend";
+        } else {
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(buffer);
+            ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+            const bool is_cpu_buffer = buft == ggml_backend_cpu_buffer_type() ||
+                (device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!is_cpu_buffer) {
+                row.status = "non_cpu_backend";
+            } else {
+                void * base = ggml_backend_buffer_get_base(buffer);
+                if (!base) {
+                    row.status = "null_base";
+                } else {
+                    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(base);
+                    if (row.allocated_bytes > std::numeric_limits<uintptr_t>::max() - base_addr) {
+                        row.status = "address_overflow";
+                    } else {
+                        row.buffer_start = base_addr;
+                        row.buffer_end = base_addr + static_cast<uintptr_t>(row.allocated_bytes);
+                        row.has_range = true;
+                        const auto range_status = llama_kv_residency::align_range(
+                                base_addr, row.allocated_bytes, static_cast<uintptr_t>(page_size),
+                                row.aligned_start, row.aligned_end);
+                        if (range_status == llama_kv_residency::range_status::address_overflow) {
+                            row.status = "address_overflow";
+                        } else if (range_status == llama_kv_residency::range_status::alignment_overflow) {
+                            row.status = "alignment_overflow";
+                        } else if (range_status == llama_kv_residency::range_status::empty) {
+                            row.status = "empty_aligned_range";
+                        } else if (!maps_available) {
+                            row.has_aligned_range = true;
+                            row.status = "maps_open_failed";
+                            row.error_no = maps_error_no;
+                        } else {
+                            row.has_aligned_range = true;
+                            row.mappings = llama_kv_vma::calculate_intersections(
+                                    row.buffer_start, row.buffer_end, mappings);
+                            row.has_report = true;
+                            if (!maps_complete) {
+                                row.status = "maps_parse_failed";
+                            } else if (row.mappings.intersections.empty()) {
+                                row.status = "not_mapped";
+                            } else if (row.mappings.uncovered_bytes > 0) {
+                                row.status = "partial_coverage";
+                            } else {
+                                row.status = "ok";
+                            }
+                        }
+                    }
+                }
+            }
+#endif
+        }
+        rows.push_back(std::move(row));
+    }
+
+    const uint64_t elapsed_ns = kv_residency_elapsed_ns(snapshot_start);
+    const char * path_env = std::getenv("LLAMA_KV_VMA_LOG_PATH");
+    const char * path = path_env && path_env[0] ? path_env : "kv_vma_maps.csv";
+    std::ofstream out(path, std::ios::app);
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to open KV VMA log '%s'\n", __func__, path);
+        return;
+    }
+    if (out.tellp() == 0) {
+        out << "schema_version,snapshot_id,ts_ns,event,stage,request_id,task_id,slot_id,record_type,"
+               "buffer_index,buffer_id,backend,allocated_bytes,page_size,buffer_start,buffer_end,"
+               "aligned_start,aligned_end,vma_index,vma_start,vma_end,vma_size,intersection_start,"
+               "intersection_end,intersection_bytes,vma_permissions,mapping_kind,mapping_name,vma_count,"
+               "covered_bytes,uncovered_bytes,current_vma_outside_buffer_bytes,total_vma_outside_buffer_bytes,"
+               "elapsed_ns,status,errno\n";
+    }
+
+    auto write_row = [&](const kv_vma_buffer_row & row, const llama_kv_vma::intersection * item, size_t vma_index) {
+        std::vector<std::string> columns(36);
+        columns[0] = "1";
+        columns[1] = std::to_string(snapshot_id);
+        columns[2] = std::to_string(timestamp_ns);
+        columns[3] = kv_residency_csv_field(event);
+        columns[4] = kv_residency_csv_field(stage);
+        if (fields.request_id >= 0) {
+            columns[5] = std::to_string(fields.request_id);
+        }
+        if (fields.task_id >= 0) {
+            columns[6] = std::to_string(fields.task_id);
+        }
+        if (fields.slot_id >= 0) {
+            columns[7] = std::to_string(fields.slot_id);
+        }
+        columns[8] = item ? "VMA" : "BUFFER";
+        columns[9] = std::to_string(row.buffer_index);
+        columns[10] = std::to_string(row.buffer_id);
+        columns[11] = kv_residency_csv_field(row.backend.c_str());
+        columns[12] = std::to_string(row.allocated_bytes);
+        columns[13] = std::to_string(row.page_size);
+        if (row.has_range) {
+            columns[14] = std::to_string(row.buffer_start);
+            columns[15] = std::to_string(row.buffer_end);
+        }
+        if (row.has_aligned_range) {
+            columns[16] = std::to_string(row.aligned_start);
+            columns[17] = std::to_string(row.aligned_end);
+        }
+        if (item) {
+            columns[18] = std::to_string(vma_index);
+            columns[19] = std::to_string(item->vma.start);
+            columns[20] = std::to_string(item->vma.end);
+            columns[21] = std::to_string(item->vma_size());
+            columns[22] = std::to_string(item->start);
+            columns[23] = std::to_string(item->end);
+            columns[24] = std::to_string(item->size());
+            columns[25] = kv_residency_csv_field(item->vma.permissions.c_str());
+            columns[26] = kv_residency_csv_field(llama_kv_vma::mapping_kind(item->vma.name));
+            columns[27] = kv_residency_csv_field(item->vma.name.c_str());
+            columns[31] = std::to_string(item->outside_buffer_bytes());
+        }
+        if (row.has_report) {
+            columns[28] = std::to_string(row.mappings.intersections.size());
+            columns[29] = std::to_string(row.mappings.covered_bytes);
+            columns[30] = std::to_string(row.mappings.uncovered_bytes);
+            columns[32] = std::to_string(row.mappings.total_vma_outside_buffer_bytes);
+        }
+        columns[33] = std::to_string(elapsed_ns);
+        columns[34] = kv_residency_csv_field(row.status.c_str());
+        columns[35] = std::to_string(row.error_no);
+        for (size_t i = 0; i < columns.size(); ++i) {
+            if (i > 0) {
+                out << ',';
+            }
+            out << columns[i];
+        }
+        out << '\n';
+    };
+
+    for (const auto & row : rows) {
+        write_row(row, nullptr, 0);
+        for (size_t i = 0; i < row.mappings.intersections.size(); ++i) {
+            write_row(row, &row.mappings.intersections[i], i);
+        }
+    }
+    out.close();
+    if (!out) {
+        LLAMA_LOG_ERROR("%s: failed to write KV VMA log '%s'\n", __func__, path);
     }
 }
 

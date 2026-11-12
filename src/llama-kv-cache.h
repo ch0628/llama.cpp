@@ -7,12 +7,14 @@
 
 #include <unordered_map>
 #include <vector>
+#include <memory>
 
 struct llama_cparams;
 struct llama_hparams;
 struct llama_model;
 struct llama_context;
 struct phase_fields;
+struct llama_kv_repeated_activity_state;
 
 //
 // llama_kv_cache
@@ -117,7 +119,7 @@ public:
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "");
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -159,6 +161,8 @@ public:
     uint32_t get_size()     const;
     void fill_phase_snapshot(phase_fields & fields) const;
     void log_residency_snapshot(const char * event, const char * stage, const phase_fields & fields) const;
+    void log_vma_snapshot(const char * event, const char * stage, const phase_fields & fields) const;
+    void repeated_activity_event(const char * event, const char * stage, const phase_fields & fields) const;
     uint32_t get_n_stream() const;
 
     bool get_has_shift() const;
@@ -294,6 +298,9 @@ private:
 
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+
+    // Opt-in P5-2C worker state. It is explicitly stopped before ctxs_bufs are released.
+    mutable std::unique_ptr<llama_kv_repeated_activity_state> repeated_activity;
 
     // the current index from where we start searching for a free slot in the ring buffer of KV cells (see find_slot())
     // note: this is not part of the KV state and it's only used to speed-up the find_slot() method

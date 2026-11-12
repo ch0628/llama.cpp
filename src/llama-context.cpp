@@ -10,6 +10,8 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-kv-cache.h"
+#include "llama-kv-vma.h"
+#include "llama-page-activity.h"
 #include "llama-phase-events.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
@@ -21,9 +23,17 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <limits>
+#include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+
+#if defined(__linux__)
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 phase_log & phase_logger() {
     static phase_log log;
@@ -65,18 +75,217 @@ void kv_residency_snapshot(
         const char * event,
         const char * stage,
         phase_fields fields) {
-    const char * enabled = std::getenv("LLAMA_KV_RESIDENCY_DIAGNOSTIC");
-    if (!ctx || !enabled || enabled[0] != '1' || enabled[1] != '\0') {
+    const bool residency_enabled = llama_kv_vma::enabled_value(std::getenv("LLAMA_KV_RESIDENCY_DIAGNOSTIC"));
+    const bool vma_enabled = llama_kv_vma::enabled_value(std::getenv("LLAMA_KV_VMA_DIAGNOSTIC"));
+    const bool repeated_activity_enabled = llama_kv_vma::enabled_value(
+            std::getenv("LLAMA_KV_REPEATED_ACTIVITY_DIAGNOSTIC"));
+    if (!ctx || (!residency_enabled && !vma_enabled && !repeated_activity_enabled)) {
         return;
     }
     if (const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory())) {
-        try {
-            kv->log_residency_snapshot(event, stage, fields);
-        } catch (const std::exception & error) {
-            LLAMA_LOG_ERROR("%s: KV residency snapshot failed: %s\n", __func__, error.what());
-        } catch (...) {
-            LLAMA_LOG_ERROR("%s: KV residency snapshot failed with an unknown error\n", __func__);
+        if (residency_enabled) {
+            try {
+                kv->log_residency_snapshot(event, stage, fields);
+            } catch (const std::exception & error) {
+                LLAMA_LOG_ERROR("%s: KV residency snapshot failed: %s\n", __func__, error.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: KV residency snapshot failed with an unknown error\n", __func__);
+            }
         }
+        if (vma_enabled) {
+            try {
+                kv->log_vma_snapshot(event, stage, fields);
+            } catch (const std::exception & error) {
+                LLAMA_LOG_ERROR("%s: KV VMA snapshot failed: %s\n", __func__, error.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: KV VMA snapshot failed with an unknown error\n", __func__);
+            }
+        }
+        if (repeated_activity_enabled) {
+            try {
+                kv->repeated_activity_event(event, stage, fields);
+            } catch (const std::exception & error) {
+                LLAMA_LOG_ERROR("%s: KV repeated activity event failed: %s\n", __func__, error.what());
+            } catch (...) {
+                LLAMA_LOG_ERROR("%s: KV repeated activity event failed with an unknown error\n", __func__);
+            }
+        }
+    }
+}
+
+namespace {
+
+struct page_activity_sample {
+    llama_page_activity::optional_u64 page_size_bytes;
+    llama_page_activity::optional_u64 process_minor_faults;
+    llama_page_activity::optional_u64 process_major_faults;
+    llama_page_activity::process_status process_status;
+    llama_page_activity::vmstat_counters vmstat;
+    std::string source_errors;
+};
+
+void page_activity_append(std::string & output, const char * value) {
+    if (!output.empty()) {
+        output += '|';
+    }
+    output += value;
+}
+
+page_activity_sample page_activity_collect() {
+    page_activity_sample sample;
+#if defined(__linux__)
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size > 0) {
+        sample.page_size_bytes = { true, static_cast<uint64_t>(page_size) };
+    } else {
+        page_activity_append(sample.source_errors, "sysconf_failed");
+    }
+
+    rusage usage = {};
+    if (getrusage(RUSAGE_SELF, &usage) == 0) {
+        if (usage.ru_minflt >= 0) {
+            sample.process_minor_faults = { true, static_cast<uint64_t>(usage.ru_minflt) };
+        }
+        if (usage.ru_majflt >= 0) {
+            sample.process_major_faults = { true, static_cast<uint64_t>(usage.ru_majflt) };
+        }
+    } else {
+        page_activity_append(sample.source_errors, "getrusage_failed");
+    }
+
+    errno = 0;
+    std::ifstream status("/proc/self/status");
+    if (status) {
+        sample.process_status = llama_page_activity::parse_process_status(status);
+    } else {
+        page_activity_append(sample.source_errors, "proc_self_status_open_failed");
+    }
+
+    errno = 0;
+    std::ifstream vmstat("/proc/vmstat");
+    if (vmstat) {
+        sample.vmstat = llama_page_activity::parse_vmstat(vmstat);
+    } else {
+        page_activity_append(sample.source_errors, "proc_vmstat_open_failed");
+    }
+#else
+    page_activity_append(sample.source_errors, "unsupported_platform");
+#endif
+    return sample;
+}
+
+std::string page_activity_missing_fields(const page_activity_sample & sample) {
+    std::string missing;
+    auto check = [&](const llama_page_activity::optional_u64 & field, const char * name) {
+        if (!field.available) {
+            page_activity_append(missing, name);
+        }
+    };
+    check(sample.page_size_bytes, "page_size_bytes");
+    check(sample.process_minor_faults, "process_minor_faults");
+    check(sample.process_major_faults, "process_major_faults");
+    check(sample.process_status.vm_rss_kib, "vm_rss_kib");
+    check(sample.process_status.vm_swap_kib, "vm_swap_kib");
+    check(sample.vmstat.pgscan_kswapd_pages, "pgscan_kswapd_pages");
+    check(sample.vmstat.pgscan_direct_pages, "pgscan_direct_pages");
+    check(sample.vmstat.pgsteal_kswapd_pages, "pgsteal_kswapd_pages");
+    check(sample.vmstat.pgsteal_direct_pages, "pgsteal_direct_pages");
+    check(sample.vmstat.allocstall_normal, "allocstall_normal");
+    check(sample.vmstat.pswpin_pages, "pswpin_pages");
+    check(sample.vmstat.pswpout_pages, "pswpout_pages");
+    return missing;
+}
+
+void page_activity_write_csv_field(std::ostream & output, const std::string & value) {
+    if (value.find_first_of(",\"\r\n") == std::string::npos) {
+        output << value;
+        return;
+    }
+    output << '"';
+    for (char character : value) {
+        if (character == '"') {
+            output << '"';
+        }
+        output << character;
+    }
+    output << '"';
+}
+
+} // namespace
+
+void page_activity_snapshot(const char * event, const char * stage, phase_fields fields) {
+    if (!llama_page_activity::enabled_value(std::getenv("LLAMA_PAGE_ACTIVITY_DIAGNOSTIC"))) {
+        return;
+    }
+
+    static std::mutex mutex;
+    static uint64_t next_snapshot_id = 1;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    const uint64_t timestamp_ns = phase_now_ns();
+    const page_activity_sample sample = page_activity_collect();
+    const uint64_t collection_end_ns = phase_now_ns();
+    const uint64_t collect_elapsed_ns = collection_end_ns >= timestamp_ns ? collection_end_ns - timestamp_ns : 0;
+    const std::string missing = page_activity_missing_fields(sample);
+    const bool any_activity_metric =
+        sample.process_minor_faults.available || sample.process_major_faults.available ||
+        sample.process_status.vm_rss_kib.available || sample.process_status.vm_swap_kib.available ||
+        sample.vmstat.pgscan_kswapd_pages.available || sample.vmstat.pgscan_direct_pages.available ||
+        sample.vmstat.pgsteal_kswapd_pages.available || sample.vmstat.pgsteal_direct_pages.available ||
+        sample.vmstat.allocstall_normal.available || sample.vmstat.pswpin_pages.available ||
+        sample.vmstat.pswpout_pages.available;
+    const char * status = missing.empty() ? "ok" : (any_activity_metric ? "partial" : "unavailable");
+
+    const char * configured_path = std::getenv("LLAMA_PAGE_ACTIVITY_LOG_PATH");
+    const char * path = configured_path && configured_path[0] ? configured_path : "page_activity.csv";
+    std::ofstream output(path, std::ios::app);
+    if (!output) {
+        LLAMA_LOG_ERROR("%s: failed to open page activity log '%s'\n", __func__, path);
+        return;
+    }
+    if (output.tellp() == 0) {
+        output << "schema_version,snapshot_id,ts_ns,clock_domain,event,stage,request_id,task_id,slot_id,"
+                  "page_size_bytes,process_minor_faults,process_major_faults,vm_rss_kib,vm_swap_kib,"
+                  "pgscan_kswapd_pages,pgscan_direct_pages,pgsteal_kswapd_pages,pgsteal_direct_pages,"
+                  "allocstall_normal,pswpin_pages,pswpout_pages,collect_elapsed_ns,missing_fields,source_errors,status\n";
+    }
+    auto optional = [&](const llama_page_activity::optional_u64 & value) {
+        if (value.available) {
+            output << value.value;
+        }
+    };
+    auto optional_i64 = [&](int64_t value) {
+        if (value >= 0) {
+            output << value;
+        }
+    };
+
+    output << "1," << next_snapshot_id++ << ',' << timestamp_ns << ",pi_monotonic_raw,";
+    page_activity_write_csv_field(output, event ? event : "");
+    output << ',';
+    page_activity_write_csv_field(output, stage ? stage : "");
+    output << ','; optional_i64(fields.request_id);
+    output << ','; optional_i64(fields.task_id);
+    output << ','; optional_i64(fields.slot_id);
+    output << ','; optional(sample.page_size_bytes);
+    output << ','; optional(sample.process_minor_faults);
+    output << ','; optional(sample.process_major_faults);
+    output << ','; optional(sample.process_status.vm_rss_kib);
+    output << ','; optional(sample.process_status.vm_swap_kib);
+    output << ','; optional(sample.vmstat.pgscan_kswapd_pages);
+    output << ','; optional(sample.vmstat.pgscan_direct_pages);
+    output << ','; optional(sample.vmstat.pgsteal_kswapd_pages);
+    output << ','; optional(sample.vmstat.pgsteal_direct_pages);
+    output << ','; optional(sample.vmstat.allocstall_normal);
+    output << ','; optional(sample.vmstat.pswpin_pages);
+    output << ','; optional(sample.vmstat.pswpout_pages);
+    output << ',' << collect_elapsed_ns << ',';
+    page_activity_write_csv_field(output, missing);
+    output << ',';
+    page_activity_write_csv_field(output, sample.source_errors);
+    output << ',' << status << '\n';
+    if (!output) {
+        LLAMA_LOG_ERROR("%s: failed to write page activity log '%s'\n", __func__, path);
     }
 }
 
@@ -454,6 +663,7 @@ llama_context::llama_context(
 
         memory.reset(model.create_memory(params_mem, cparams));
         phase_kv_snapshot(this, "KV_ALLOCATION_READY");
+        page_activity_snapshot("KV_ALLOCATION_READY", "INIT");
         kv_residency_snapshot(this, "KV_ALLOCATION_READY", "INIT");
     }
 
@@ -543,6 +753,9 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    if (llama_kv_page_coverage_enabled()) {
+        ggml_cpu_kv_coverage_flush();
+    }
     if (llama_attn_linking_enabled()) {
         ggml_cpu_attn_diag_clear_generation(attn_graph_generation);
     }
@@ -1494,6 +1707,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     if (llama_attn_linking_enabled()) {
+        if (llama_kv_page_coverage_enabled()) {
+            ggml_cgraph * graph = res->get_gf();
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+                ggml_tensor * node = ggml_graph_node(graph, i);
+                ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), node);
+                if (!backend || !ggml_backend_is_cpu(backend)) {
+                    ggml_cpu_kv_coverage_mark_unsupported_backend(
+                        node, backend ? ggml_backend_name(backend) : "UNASSIGNED");
+                }
+            }
+        }
         const auto & call = phase_active_call();
         ggml_cpu_attn_diag_link link = {};
         link.graph_generation = attn_graph_generation;
