@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <mutex>
+#include <unordered_map>
 #include <vector>
 #include <ctime>
 
@@ -77,6 +78,12 @@ struct phase_record {
 struct phase_log {
     std::mutex mutex;
     std::vector<phase_record> records;
+    struct prefill_total {
+        uint64_t duration_ns = 0;
+        int64_t q_len = 0;
+    };
+    std::unordered_map<int64_t, int64_t> last_prefill_call;
+    std::unordered_map<int64_t, prefill_total> prefill_totals;
     uint64_t run_id = 0;
     uint64_t next_seq = 1;
     uint64_t next_span = 1;
@@ -107,6 +114,7 @@ struct phase_request_context {
 };
 
 LLAMA_API phase_request_context & phase_active_request();
+LLAMA_API bool phase_call_linking_enabled();
 
 LLAMA_API void phase_kv_snapshot(const llama_context * ctx, const char * name, phase_fields fields = {});
 LLAMA_API void kv_residency_snapshot(
@@ -144,6 +152,19 @@ inline const char * phase_events_path() {
 #else
     return nullptr;
 #endif
+}
+
+inline bool phase_env_explicitly_disabled(const char * name) {
+    const char * value = std::getenv(name);
+    return value && value[0] == '0' && value[1] == '\0';
+}
+
+inline bool phase_generic_call_timing_enabled() {
+    return phase_events_path() && !phase_env_explicitly_disabled("LLAMA_GENERIC_CALL_TIMING");
+}
+
+inline bool phase_kv_snapshot_enabled() {
+    return phase_events_path() && !phase_env_explicitly_disabled("LLAMA_KV_PHASE_SNAPSHOT");
 }
 
 inline bool phase_diagnostic() {
@@ -186,12 +207,86 @@ inline uint64_t phase_event(const char * component, const char * name, phase_kin
     return span_id;
 }
 
+inline uint64_t phase_next_link_id() {
+    auto & log = phase_logger();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    return log.next_span++;
+}
+
+inline uint64_t phase_resolve_call_id(uint64_t generic_span, uint64_t legacy_span) {
+    if (generic_span) {
+        return generic_span;
+    }
+    if (legacy_span) {
+        return legacy_span;
+    }
+    return phase_call_linking_enabled() ? phase_next_link_id() : 0;
+}
+
+inline void phase_note_prefill_call(int64_t request_id, uint64_t call_id) {
+    if (request_id < 0 || !call_id || !phase_call_linking_enabled()) {
+        return;
+    }
+    auto & log = phase_logger();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.last_prefill_call[request_id] = static_cast<int64_t>(call_id);
+}
+
+inline void phase_prefill_total_reset(int64_t request_id) {
+    if (request_id < 0 || !phase_events_path() || phase_generic_call_timing_enabled()) {
+        return;
+    }
+    auto & log = phase_logger();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    log.prefill_totals[request_id] = {};
+}
+
+inline void phase_prefill_total_add(const phase_fields & fields) {
+    if (fields.request_id < 0 || fields.status != 0 || fields.duration_ns <= 0 ||
+            !phase_events_path() || phase_generic_call_timing_enabled()) {
+        return;
+    }
+    auto & log = phase_logger();
+    std::lock_guard<std::mutex> lock(log.mutex);
+    auto & total = log.prefill_totals[fields.request_id];
+    total.duration_ns += static_cast<uint64_t>(fields.duration_ns);
+    if (fields.q_len > 0) {
+        total.q_len += fields.q_len;
+    }
+}
+
+inline void phase_prefill_total_emit(phase_fields fields) {
+    if (fields.request_id < 0 || !phase_events_path() || phase_generic_call_timing_enabled()) {
+        return;
+    }
+    phase_log::prefill_total total;
+    {
+        auto & log = phase_logger();
+        std::lock_guard<std::mutex> lock(log.mutex);
+        const auto found = log.prefill_totals.find(fields.request_id);
+        if (found == log.prefill_totals.end() || found->second.duration_ns == 0) {
+            return;
+        }
+        total = found->second;
+        log.prefill_totals.erase(found);
+    }
+    fields.duration_ns = static_cast<int64_t>(total.duration_ns);
+    fields.q_len = total.q_len;
+    fields.status = 0;
+    fields.note = "sum_prompt_llama_decode_calls";
+    phase_event("server", "LLM_PREFILL_EVAL_TOTAL", phase_kind::POINT, 0, fields);
+}
+
 inline int64_t phase_last_prefill_call(int64_t request_id) {
     if (!phase_events_path()) {
         return -1;
     }
     auto & log = phase_logger();
     std::lock_guard<std::mutex> lock(log.mutex);
+    const auto tracked = log.last_prefill_call.find(request_id);
+    if (tracked != log.last_prefill_call.end()) {
+        return tracked->second;
+    }
     for (auto it = log.records.rbegin(); it != log.records.rend(); ++it) {
         if (it->fields.request_id == request_id && it->kind == phase_kind::CALL_RETURN &&
             std::strcmp(it->name, "LLM_PREFILL_CALL_RETURN") == 0) {
@@ -281,6 +376,8 @@ inline bool phase_flush() {
         return false;
     }
     log.records.clear();
+    log.last_prefill_call.clear();
+    log.prefill_totals.clear();
     log.run_id = 0;
     return true;
 }

@@ -57,8 +57,12 @@ phase_request_context & phase_active_request() {
     return request;
 }
 
+bool phase_call_linking_enabled() {
+    return phase_events_path() || llama_attn_linking_enabled();
+}
+
 void phase_kv_snapshot(const llama_context * ctx, const char * name, phase_fields fields) {
-    if (!phase_events_path() || !ctx) {
+    if (!phase_kv_snapshot_enabled() || !ctx) {
         return;
     }
     if (const auto * kv = dynamic_cast<const llama_kv_cache *>(ctx->get_memory())) {

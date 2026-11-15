@@ -1832,6 +1832,7 @@ private:
             phase_event("server", "SERVER_INFERENCE_START", phase_kind::POINT, 0, fields);
             fields.request_id = fields.task_id;
             fields.seq_id = slot.id;
+            phase_prefill_total_reset(fields.request_id);
             phase_kv_snapshot(ctx_tgt, "KV_PRE_REQUEST", fields);
             page_activity_snapshot("KV_PRE_REQUEST", "REQUEST_START", fields);
             kv_residency_snapshot(ctx_tgt, "KV_PRE_REQUEST", "REQUEST_START", fields);
@@ -3769,11 +3770,13 @@ private:
         queue_tasks.yield_to_queue([&]() {
             const bool legacy_text = one_phase && is_prompt && all_text;
             const bool legacy_decode = one_phase && !is_prompt;
-            const auto generic_span = any_prompt ? phase_event("server", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
+            const bool generic_timing = any_prompt && phase_generic_call_timing_enabled();
+            const auto generic_span = generic_timing ? phase_event("server", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
             const auto decode_span = legacy_text || legacy_decode ? phase_event("server", legacy_text ? "TEXT_PREFILL_CALL_START" : "GENERATED_TOKEN_EVAL_CALL_START", phase_kind::CALL_START, 0, decode_fields) : 0;
-            if (generic_span || decode_span) {
-                decode_fields.call_id = generic_span ? generic_span : decode_span;
-                phase_set_call(decode_span ? decode_span : generic_span, decode_fields.decode_step_idx);
+            const auto link_call_id = phase_resolve_call_id(generic_span, decode_span);
+            if (link_call_id) {
+                decode_fields.call_id = link_call_id;
+                phase_set_call(decode_span ? decode_span : link_call_id, decode_fields.decode_step_idx);
                 auto link_fields = decode_fields;
                 if (!one_phase) {
                     link_fields.request_id = -1;
@@ -3786,21 +3789,27 @@ private:
             if (any_prompt) {
                 phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_BEFORE", decode_fields);
             }
-            const uint64_t call_start_ns = phase_now_ns();
+            const uint64_t call_start_ns = phase_events_path() ? phase_now_ns() : 0;
             try {
                 ret = llama_decode(ctx_tgt, batch_view);
             } catch (...) {
                 if (any_prompt) {
                     decode_fields.note = "exception";
-                    decode_fields.duration_ns = phase_now_ns() - call_start_ns;
-                    phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                    if (call_start_ns) {
+                        decode_fields.duration_ns = phase_now_ns() - call_start_ns;
+                    }
+                    if (generic_timing) {
+                        phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                    }
                     phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_AFTER", decode_fields);
                 }
                 phase_set_call(0);
                 phase_flush();
                 throw;
             }
-            decode_fields.duration_ns = phase_now_ns() - call_start_ns;
+            if (call_start_ns) {
+                decode_fields.duration_ns = phase_now_ns() - call_start_ns;
+            }
             decode_fields.status = ret;
             if (decode_span) {
                 auto legacy_fields = decode_fields;
@@ -3808,7 +3817,13 @@ private:
                 phase_event("server", legacy_text ? "TEXT_PREFILL_CALL_RETURN" : "GENERATED_TOKEN_EVAL_CALL_RETURN", phase_kind::CALL_RETURN, decode_span, legacy_fields);
             }
             if (any_prompt) {
-                phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                if (generic_timing) {
+                    phase_event("server", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, decode_fields);
+                }
+                if (ret == 0) {
+                    phase_note_prefill_call(decode_fields.request_id, link_call_id);
+                    phase_prefill_total_add(decode_fields);
+                }
                 phase_kv_snapshot(ctx_tgt, "KV_PREFILL_CALL_AFTER", decode_fields);
             }
             phase_set_call(0);
@@ -3978,6 +3993,9 @@ private:
                 phase_fields fields;
                 fields.task_id = slot.task->id;
                 fields.slot_id = slot.id;
+                auto total_fields = fields;
+                total_fields.request_id = total_fields.task_id;
+                phase_prefill_total_emit(total_fields);
                 phase_event("server", "PREFILL_SUBMISSION_COMPLETE", phase_kind::POINT, 0, fields);
                 fields.request_id = fields.task_id;
                 fields.seq_id = slot.id;

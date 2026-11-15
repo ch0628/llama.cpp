@@ -188,35 +188,49 @@ int32_t mtmd_helper_decode_image_chunk(
         prefill_fields.pos_start = batch_embd_view.pos[0];
         prefill_fields.pos_end = batch_embd_view.pos[batch_embd_view.n_tokens - 1];
         prefill_fields.input_kind = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? "VISUAL" : "UNKNOWN";
-        const auto generic_span = phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields);
+        const bool generic_timing = phase_generic_call_timing_enabled();
+        const auto generic_span = generic_timing ? phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields) : 0;
         const auto prefill_span = chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE ? phase_event("mtmd", "VISUAL_PREFILL_CALL_START", phase_kind::CALL_START, 0, prefill_fields) : 0;
-        if (generic_span || prefill_span) {
-            prefill_fields.call_id = generic_span;
-            phase_set_call(prefill_span ? prefill_span : generic_span);
+        const auto link_call_id = phase_resolve_call_id(generic_span, prefill_span);
+        if (link_call_id) {
+            prefill_fields.call_id = link_call_id;
+            phase_set_call(prefill_span ? prefill_span : link_call_id);
             phase_set_link(prefill_fields, "PREFILL");
         }
         phase_kv_snapshot(lctx, "KV_PREFILL_CALL_BEFORE", prefill_fields);
-        const uint64_t call_start_ns = phase_now_ns();
+        const uint64_t call_start_ns = phase_events_path() ? phase_now_ns() : 0;
         int32_t ret;
         try {
             ret = llama_decode(lctx, batch_embd_view);
         } catch (...) {
             prefill_fields.note = "exception";
-            prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
-            phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+            if (call_start_ns) {
+                prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
+            }
+            if (generic_timing) {
+                phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+            }
             phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", prefill_fields);
             phase_set_call(0);
             phase_flush();
             throw;
         }
-        prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
+        if (call_start_ns) {
+            prefill_fields.duration_ns = phase_now_ns() - call_start_ns;
+        }
         prefill_fields.status = ret;
         if (chunk_type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
             auto legacy_fields = prefill_fields;
             legacy_fields.call_id = prefill_span;
             phase_event("mtmd", "VISUAL_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, prefill_span, legacy_fields);
         }
-        phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+        if (generic_timing) {
+            phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, prefill_fields);
+        }
+        if (ret == 0) {
+            phase_note_prefill_call(prefill_fields.request_id, link_call_id);
+            phase_prefill_total_add(prefill_fields);
+        }
         phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", prefill_fields);
         phase_set_call(0);
         if (ret != 0) {
@@ -299,26 +313,42 @@ int32_t mtmd_helper_eval_chunk_single(mtmd_context * ctx,
             fields.pos_start = text_batch.pos[0];
             fields.pos_end = text_batch.pos[text_batch.n_tokens - 1];
             fields.input_kind = "TEXT";
-            const auto span = phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, fields);
-            fields.call_id = span ? span : -1;
-            phase_set_call(span);
-            phase_set_link(fields, "PREFILL");
+            const bool generic_timing = phase_generic_call_timing_enabled();
+            const auto span = generic_timing ? phase_event("mtmd", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, fields) : 0;
+            const auto link_call_id = phase_resolve_call_id(span, 0);
+            fields.call_id = link_call_id ? static_cast<int64_t>(link_call_id) : -1;
+            if (link_call_id) {
+                phase_set_call(link_call_id);
+                phase_set_link(fields, "PREFILL");
+            }
             phase_kv_snapshot(lctx, "KV_PREFILL_CALL_BEFORE", fields);
-            const uint64_t call_start_ns = phase_now_ns();
+            const uint64_t call_start_ns = phase_events_path() ? phase_now_ns() : 0;
             try {
                 ret = llama_decode(lctx, text_batch);
             } catch (...) {
                 fields.note = "exception";
-                fields.duration_ns = phase_now_ns() - call_start_ns;
-                phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+                if (call_start_ns) {
+                    fields.duration_ns = phase_now_ns() - call_start_ns;
+                }
+                if (generic_timing) {
+                    phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+                }
                 phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", fields);
                 phase_set_call(0);
                 phase_flush();
                 throw;
             }
-            fields.duration_ns = phase_now_ns() - call_start_ns;
+            if (call_start_ns) {
+                fields.duration_ns = phase_now_ns() - call_start_ns;
+            }
             fields.status = ret;
-            phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+            if (generic_timing) {
+                phase_event("mtmd", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, span, fields);
+            }
+            if (ret == 0) {
+                phase_note_prefill_call(fields.request_id, link_call_id);
+                phase_prefill_total_add(fields);
+            }
             phase_kv_snapshot(lctx, "KV_PREFILL_CALL_AFTER", fields);
             phase_set_call(0);
             if (ret != 0) {

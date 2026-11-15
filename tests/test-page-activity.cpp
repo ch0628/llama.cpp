@@ -7,9 +7,11 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__linux__)
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -128,10 +130,171 @@ static void test_runtime_gate_and_csv() {
 #endif
 }
 
+static std::vector<std::string> split_csv(const std::string & line) {
+    std::vector<std::string> result;
+    std::istringstream input(line);
+    std::string field;
+    while (std::getline(input, field, ',')) {
+        result.push_back(field);
+    }
+    if (!line.empty() && line.back() == ',') {
+        result.emplace_back();
+    }
+    return result;
+}
+
+static void test_phase_mode_gates_and_total() {
+#if defined(__linux__)
+    auto run_phase_off_child = [](const char * linking_gate) {
+        const pid_t child = fork();
+        require(child >= 0);
+        if (child == 0) {
+            unsetenv("LLAMA_PHASE_EVENTS_PATH");
+            setenv("LLAMA_GENERIC_CALL_TIMING", "0", 1);
+            setenv("LLAMA_KV_PHASE_SNAPSHOT", "0", 1);
+            unsetenv("LLAMA_ATTN_DIAGNOSTIC");
+            unsetenv("LLAMA_CPU_ATTN_TIMING");
+            unsetenv("LLAMA_KV_PAGE_COVERAGE_DIAGNOSTIC");
+            if (linking_gate) {
+                setenv(linking_gate, "1", 1);
+            }
+            const bool gates_off = !phase_generic_call_timing_enabled() && !phase_kv_snapshot_enabled();
+            const uint64_t link_call_id = phase_resolve_call_id(0, 0);
+            const bool link_matches = linking_gate ? link_call_id != 0 : link_call_id == 0;
+            _exit(gates_off && link_matches ? 0 : 1);
+        }
+        int status = 0;
+        require(waitpid(child, &status, 0) == child);
+        require(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    };
+    run_phase_off_child(nullptr);
+    run_phase_off_child("LLAMA_ATTN_DIAGNOSTIC");
+    run_phase_off_child("LLAMA_CPU_ATTN_TIMING");
+    run_phase_off_child("LLAMA_KV_PAGE_COVERAGE_DIAGNOSTIC");
+
+    const std::string path = "/tmp/llama-phase-mode-test-" + std::to_string(getpid()) + ".csv";
+    std::remove(path.c_str());
+    setenv("LLAMA_PHASE_EVENTS_PATH", path.c_str(), 1);
+    setenv("LLAMA_GENERIC_CALL_TIMING", "false", 1);
+    setenv("LLAMA_KV_PHASE_SNAPSHOT", "00", 1);
+    require(phase_generic_call_timing_enabled());
+    require(phase_kv_snapshot_enabled());
+
+    auto set_gate = [](const char * name, const char * value) {
+        if (value) {
+            setenv(name, value, 1);
+        } else {
+            unsetenv(name);
+        }
+    };
+    auto record_case = [&](int64_t request_id, const char * generic, const char * kv_snapshot) {
+        set_gate("LLAMA_GENERIC_CALL_TIMING", generic);
+        set_gate("LLAMA_KV_PHASE_SNAPSHOT", kv_snapshot);
+
+        phase_fields fields;
+        fields.request_id = request_id;
+        fields.task_id = request_id;
+        fields.slot_id = 3;
+        fields.status = 0;
+        phase_prefill_total_reset(request_id);
+        phase_event("test", "PHASE_MARKER", phase_kind::POINT, 0, fields);
+
+        uint64_t generic_span = 0;
+        if (phase_generic_call_timing_enabled()) {
+            generic_span = phase_event(
+                "test", "LLM_PREFILL_CALL_START", phase_kind::CALL_START, 0, fields);
+            require(phase_resolve_call_id(generic_span, generic_span + 1) == generic_span);
+        }
+        if (phase_kv_snapshot_enabled()) {
+            phase_event("test", "KV_TEST_SNAPSHOT", phase_kind::POINT, 0, fields);
+        }
+
+        fields.duration_ns = 10;
+        fields.q_len = 4;
+        phase_prefill_total_add(fields);
+        fields.duration_ns = 20;
+        fields.q_len = 6;
+        phase_prefill_total_add(fields);
+        if (generic_span) {
+            phase_event("test", "LLM_PREFILL_CALL_RETURN", phase_kind::CALL_RETURN, generic_span, fields);
+        } else {
+            const uint64_t link_call_id = phase_resolve_call_id(0, 0);
+            require(link_call_id != 0);
+            fields.call_id = static_cast<int64_t>(link_call_id);
+            phase_set_call(link_call_id, 5);
+            phase_set_link(fields, "PREFILL");
+            phase_active_call().ubatch_idx = 2;
+            require(phase_active_call().call_id == link_call_id);
+            require(phase_active_call().link_call_id == link_call_id);
+            require(phase_active_call().request_id == request_id);
+            require(phase_active_call().ubatch_idx == 2);
+            require(std::string(phase_active_call().stage) == "PREFILL");
+            phase_set_call(0);
+            phase_note_prefill_call(request_id, link_call_id);
+            require(phase_last_prefill_call(request_id) == static_cast<int64_t>(link_call_id));
+        }
+        phase_prefill_total_emit(fields);
+        require(phase_flush());
+    };
+
+    record_case(10, nullptr, nullptr); // E: legacy Generic + KV-A
+    record_case(20, nullptr, "0");  // C: Generic only
+    record_case(30, "0", nullptr);  // D: KV-A only
+    record_case(40, "0", "0");    // B: Phase only
+
+    std::ifstream input(path);
+    require(input.good());
+    std::string line;
+    require(bool(std::getline(input, line)));
+    const auto header = split_csv(line);
+    std::unordered_map<std::string, size_t> columns;
+    for (size_t i = 0; i < header.size(); ++i) {
+        columns[header[i]] = i;
+    }
+    struct observed_case {
+        int phase = 0;
+        int generic = 0;
+        int kv_snapshot = 0;
+        int total = 0;
+        bool valid_total = false;
+    };
+    std::unordered_map<int64_t, observed_case> observed;
+    while (std::getline(input, line)) {
+        const auto row = split_csv(line);
+        require(row.size() == header.size());
+        const auto request = row[columns["request_id"]];
+        require(!request.empty());
+        auto & current = observed[std::stoll(request)];
+        const auto & name = row[columns["event_name"]];
+        if (name == "PHASE_MARKER") {
+            current.phase++;
+        }
+        if (name == "LLM_PREFILL_CALL_RETURN") {
+            current.generic++;
+        }
+        if (name == "KV_TEST_SNAPSHOT") {
+            current.kv_snapshot++;
+        }
+        if (name == "LLM_PREFILL_EVAL_TOTAL") {
+            current.total++;
+            current.valid_total = row[columns["duration_ns"]] == "30" &&
+                row[columns["q_len"]] == "10" &&
+                row[columns["note"]] == "sum_prompt_llama_decode_calls";
+        }
+    }
+    require(observed[10].phase == 1 && observed[10].generic == 1 && observed[10].kv_snapshot == 1 && observed[10].total == 0);
+    require(observed[20].phase == 1 && observed[20].generic == 1 && observed[20].kv_snapshot == 0 && observed[20].total == 0);
+    require(observed[30].phase == 1 && observed[30].generic == 0 && observed[30].kv_snapshot == 1 && observed[30].total == 1 && observed[30].valid_total);
+    require(observed[40].phase == 1 && observed[40].generic == 0 && observed[40].kv_snapshot == 0 && observed[40].total == 1 && observed[40].valid_total);
+    std::remove(path.c_str());
+#endif
+}
+
 int main() {
     test_process_status_parser();
     test_vmstat_parser();
     test_deltas_and_gate();
     test_runtime_gate_and_csv();
+    test_phase_mode_gates_and_total();
     return 0;
 }
