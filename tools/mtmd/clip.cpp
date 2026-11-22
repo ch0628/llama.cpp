@@ -9,6 +9,7 @@
 #include "ggml-cpp.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 #include "gguf.h"
 
 #include <algorithm>
@@ -5754,7 +5755,17 @@ bool clip_encode(struct clip_ctx * ctx, struct clip_encode_params * params) {
 
     phase_event("vision", "VISION_INPUT_SETUP_END", phase_kind::END, input_span);
     const auto compute_span = phase_event("vision", "VISION_COMPUTE_START", phase_kind::START);
+    static const bool vision_group_timing = []() {
+        const char * value = std::getenv("LLAMA_VISION_GROUP_TIMING");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (vision_group_timing) {
+        ggml_cpu_vision_group_timing_set_context(compute_span, true);
+    }
     auto status = ggml_backend_sched_graph_compute(ctx->sched.get(), gf);
+    if (vision_group_timing) {
+        ggml_cpu_vision_group_timing_set_context(0, false);
+    }
     phase_fields compute_fields;
     compute_fields.status = status;
     phase_event("vision", "VISION_COMPUTE_END", phase_kind::END, compute_span, compute_fields);

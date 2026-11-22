@@ -486,6 +486,30 @@ struct ggml_cpu_attn_timing_worker {
     bool attempted;
 };
 
+enum ggml_cpu_vision_group {
+    GGML_CPU_VISION_GROUP_PATCH_POSITION = 0,
+    GGML_CPU_VISION_GROUP_ATTENTION,
+    GGML_CPU_VISION_GROUP_FFN,
+    GGML_CPU_VISION_GROUP_MAIN_MERGER,
+    GGML_CPU_VISION_GROUP_DEEPSTACK,
+    GGML_CPU_VISION_GROUP_OTHER,
+    GGML_CPU_VISION_GROUP_COUNT,
+};
+
+struct ggml_cpu_vision_timing_worker {
+    uint64_t start_ns;
+    uint64_t end_ns;
+    bool started;
+    bool completed;
+};
+
+struct ggml_cpu_vision_timing_segment {
+    enum ggml_cpu_vision_group group;
+    int32_t layer;
+    int node_start;
+    int node_end;
+};
+
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -516,6 +540,18 @@ struct ggml_threadpool {
     int attn_timing_n_nodes;
     int attn_timing_n_threads;
     bool attn_timing_active;
+
+    struct ggml_cpu_vision_timing_worker * vision_timing_workers;
+    struct ggml_cpu_vision_timing_segment * vision_timing_segments;
+    int * vision_timing_node_segments;
+    size_t vision_timing_worker_capacity;
+    size_t vision_timing_node_capacity;
+    int vision_timing_n_segments;
+    int vision_timing_n_threads;
+    uint64_t vision_timing_execution_id;
+    uint64_t vision_timing_phase_span_id;
+    bool vision_timing_active;
+    bool vision_timing_mapping_valid;
 
     enum ggml_status ec;
 };
@@ -2782,6 +2818,9 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     ggml_aligned_free(threadpool->workers, workers_size);
     free(threadpool->attn_timing_workers);
     free(threadpool->attn_timing_links);
+    free(threadpool->vision_timing_workers);
+    free(threadpool->vision_timing_segments);
+    free(threadpool->vision_timing_node_segments);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
@@ -3085,6 +3124,10 @@ struct ggml_cplan ggml_graph_plan(
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 static bool ggml_cpu_attn_timing = false;     // initialized once in ggml_cpu_init(), read-only afterwards
 static bool ggml_cpu_attn_timing_raw = false; // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_vision_group_timing = false; // initialized once in ggml_cpu_init(), read-only afterwards
+static atomic_uint_fast64_t ggml_cpu_vision_group_next_execution_id = 0;
+static atomic_uint_fast64_t ggml_cpu_vision_group_phase_span_id = 0;
+static atomic_bool ggml_cpu_vision_group_context_active = false;
 
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
@@ -3130,6 +3173,266 @@ static uint64_t ggml_cpu_attn_timing_now_ns(void) {
 #else
     return 0;
 #endif
+}
+
+void ggml_cpu_vision_group_timing_set_context(uint64_t phase_span_id, bool active) {
+    if (active) {
+        atomic_store_explicit(&ggml_cpu_vision_group_phase_span_id, phase_span_id, memory_order_relaxed);
+        atomic_store_explicit(&ggml_cpu_vision_group_context_active, true, memory_order_release);
+    } else {
+        atomic_store_explicit(&ggml_cpu_vision_group_context_active, false, memory_order_release);
+        atomic_store_explicit(&ggml_cpu_vision_group_phase_span_id, 0, memory_order_relaxed);
+    }
+}
+
+static const char * ggml_cpu_vision_group_name(enum ggml_cpu_vision_group group) {
+    switch (group) {
+        case GGML_CPU_VISION_GROUP_PATCH_POSITION: return "PATCH_POSITION";
+        case GGML_CPU_VISION_GROUP_ATTENTION:      return "ATTENTION";
+        case GGML_CPU_VISION_GROUP_FFN:           return "FFN";
+        case GGML_CPU_VISION_GROUP_MAIN_MERGER:   return "MAIN_MERGER";
+        case GGML_CPU_VISION_GROUP_DEEPSTACK:     return "DEEPSTACK";
+        case GGML_CPU_VISION_GROUP_OTHER:         return "OTHER";
+        case GGML_CPU_VISION_GROUP_COUNT:         break;
+    }
+    return "UNKNOWN";
+}
+
+static bool ggml_cpu_vision_parse_layer_marker(const char * name, const char * prefix, int * layer) {
+    const size_t prefix_len = strlen(prefix);
+    if (strncmp(name, prefix, prefix_len) != 0 || name[prefix_len] == '\0') {
+        return false;
+    }
+
+    char * end = NULL;
+    const long value = strtol(name + prefix_len, &end, 10);
+    if (end == name + prefix_len || *end != '\0' || value < 0 || value > INT_MAX) {
+        return false;
+    }
+    *layer = (int) value;
+    return true;
+}
+
+static bool ggml_cpu_vision_node_is_executable(const struct ggml_tensor * node) {
+    return !ggml_op_is_empty(node->op) && (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
+static int ggml_cpu_vision_next_deepstack_layer(const struct ggml_cgraph * cgraph, int node_start) {
+    for (int node_n = node_start; node_n < cgraph->n_nodes; ++node_n) {
+        int layer = -1;
+        if (ggml_cpu_vision_parse_layer_marker(cgraph->nodes[node_n]->name, "vision_group_deepstack_out-", &layer)) {
+            return layer;
+        }
+        if (strcmp(cgraph->nodes[node_n]->name, "vision_group_output") == 0) {
+            break;
+        }
+    }
+    return -1;
+}
+
+static bool ggml_cpu_vision_group_timing_prepare(struct ggml_threadpool * tp, const struct ggml_cgraph * cgraph, int n_threads) {
+    tp->vision_timing_active = false;
+    tp->vision_timing_mapping_valid = false;
+    tp->vision_timing_n_segments = 0;
+    tp->vision_timing_n_threads = 0;
+    tp->vision_timing_execution_id = 0;
+    tp->vision_timing_phase_span_id = 0;
+
+    if (!ggml_cpu_vision_group_timing ||
+            !atomic_load_explicit(&ggml_cpu_vision_group_context_active, memory_order_acquire) ||
+            cgraph->n_nodes <= 0 || n_threads <= 0) {
+        return false;
+    }
+
+    int patch_end = -1;
+    int pre_ln_end = -1;
+    int main_merger_end = -1;
+    int graph_output = -1;
+    int n_attn_markers = 0;
+    int n_ffn_markers = 0;
+    int n_deepstack_markers = 0;
+    int previous_deepstack_layer = -1;
+    bool marker_error = false;
+
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        const char * name = cgraph->nodes[node_n]->name;
+        int layer = -1;
+        if (strcmp(name, "inp_pos_emb") == 0) {
+            marker_error |= patch_end >= 0;
+            patch_end = node_n;
+        } else if (strcmp(name, "vision_group_pre_ln") == 0) {
+            marker_error |= pre_ln_end >= 0;
+            pre_ln_end = node_n;
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "ffn_inp-", &layer)) {
+            marker_error |= layer != n_attn_markers;
+            ++n_attn_markers;
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "layer_out-", &layer)) {
+            marker_error |= layer != n_ffn_markers;
+            ++n_ffn_markers;
+        } else if (strcmp(name, "vision_group_main_merger_out") == 0) {
+            marker_error |= main_merger_end >= 0;
+            main_merger_end = node_n;
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "vision_group_deepstack_out-", &layer)) {
+            marker_error |= layer <= previous_deepstack_layer;
+            previous_deepstack_layer = layer;
+            ++n_deepstack_markers;
+        } else if (strcmp(name, "vision_group_output") == 0) {
+            marker_error |= graph_output >= 0;
+            graph_output = node_n;
+        }
+    }
+
+    // Do not instrument unrelated CPU graphs. Qwen3-VL graphs are identified by
+    // the two builder markers added around the merger/deepstack join.
+    if (main_merger_end < 0 && graph_output < 0) {
+        return false;
+    }
+
+    const uint64_t execution_id = atomic_fetch_add_explicit(
+        &ggml_cpu_vision_group_next_execution_id, 1, memory_order_relaxed) + 1;
+    const uint64_t phase_span_id = atomic_load_explicit(
+        &ggml_cpu_vision_group_phase_span_id, memory_order_relaxed);
+    tp->vision_timing_execution_id = execution_id;
+    tp->vision_timing_phase_span_id = phase_span_id;
+
+    marker_error |= patch_end < 0 || n_attn_markers <= 0 || n_attn_markers != n_ffn_markers;
+    marker_error |= main_merger_end < 0 || graph_output < 0 || n_deepstack_markers <= 0;
+    marker_error |= !(patch_end < main_merger_end && main_merger_end < graph_output);
+    marker_error |= pre_ln_end >= 0 && !(patch_end < pre_ln_end && pre_ln_end < main_merger_end);
+    marker_error |= graph_output != cgraph->n_nodes - 1;
+
+    const size_t n_nodes = (size_t) cgraph->n_nodes;
+    const size_t n_workers = n_nodes * (size_t) n_threads;
+    if (n_workers / n_nodes != (size_t) n_threads ||
+            n_workers > SIZE_MAX / sizeof(struct ggml_cpu_vision_timing_worker)) {
+        fprintf(stderr, "VISION_GROUP_TIMING event=GRAPH schema_version=1 valid=0 execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " reason=SIZE_OVERFLOW nodes=%d workers=%d\n",
+            execution_id, phase_span_id, cgraph->n_nodes, n_threads);
+        return false;
+    }
+
+    struct ggml_cpu_vision_timing_worker * new_workers = NULL;
+    struct ggml_cpu_vision_timing_segment * new_segments = NULL;
+    int * new_node_segments = NULL;
+    if (n_workers > tp->vision_timing_worker_capacity) {
+        new_workers = malloc(n_workers * sizeof(*new_workers));
+    }
+    if (n_nodes > tp->vision_timing_node_capacity) {
+        new_segments = malloc(n_nodes * sizeof(*new_segments));
+        new_node_segments = malloc(n_nodes * sizeof(*new_node_segments));
+    }
+    if ((n_workers > tp->vision_timing_worker_capacity && !new_workers) ||
+            (n_nodes > tp->vision_timing_node_capacity && (!new_segments || !new_node_segments))) {
+        free(new_workers);
+        free(new_segments);
+        free(new_node_segments);
+        fprintf(stderr, "VISION_GROUP_TIMING event=GRAPH schema_version=1 valid=0 execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " reason=ALLOC_FAILED nodes=%d workers=%d\n",
+            execution_id, phase_span_id, cgraph->n_nodes, n_threads);
+        return false;
+    }
+    if (new_workers) {
+        free(tp->vision_timing_workers);
+        tp->vision_timing_workers = new_workers;
+        tp->vision_timing_worker_capacity = n_workers;
+    }
+    if (new_segments) {
+        free(tp->vision_timing_segments);
+        free(tp->vision_timing_node_segments);
+        tp->vision_timing_segments = new_segments;
+        tp->vision_timing_node_segments = new_node_segments;
+        tp->vision_timing_node_capacity = n_nodes;
+    }
+
+    memset(tp->vision_timing_workers, 0, n_workers * sizeof(*tp->vision_timing_workers));
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        tp->vision_timing_node_segments[node_n] = -1;
+    }
+
+    enum ggml_cpu_vision_group group = GGML_CPU_VISION_GROUP_PATCH_POSITION;
+    int layer = -1;
+    int expected_attn_layer = 0;
+    int expected_ffn_layer = 0;
+    int previous_segment = -1;
+    int executable_nodes = 0;
+    int mapped_nodes = 0;
+
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        const struct ggml_tensor * node = cgraph->nodes[node_n];
+        const char * name = node->name;
+        int marker_layer = -1;
+
+        if (ggml_cpu_vision_node_is_executable(node)) {
+            ++executable_nodes;
+            if (previous_segment < 0 ||
+                    tp->vision_timing_segments[previous_segment].group != group ||
+                    tp->vision_timing_segments[previous_segment].layer != layer) {
+                const int segment = tp->vision_timing_n_segments++;
+                tp->vision_timing_segments[segment] = (struct ggml_cpu_vision_timing_segment) {
+                    group, layer, node_n, node_n
+                };
+                previous_segment = segment;
+            } else {
+                tp->vision_timing_segments[previous_segment].node_end = node_n;
+            }
+            tp->vision_timing_node_segments[node_n] = previous_segment;
+            ++mapped_nodes;
+        }
+
+        if (strcmp(name, "inp_pos_emb") == 0) {
+            group = pre_ln_end >= 0 ? GGML_CPU_VISION_GROUP_OTHER : GGML_CPU_VISION_GROUP_ATTENTION;
+            layer = group == GGML_CPU_VISION_GROUP_ATTENTION ? 0 : -1;
+        } else if (strcmp(name, "vision_group_pre_ln") == 0) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_OTHER;
+            group = GGML_CPU_VISION_GROUP_ATTENTION;
+            layer = 0;
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "ffn_inp-", &marker_layer)) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_ATTENTION || marker_layer != expected_attn_layer;
+            ++expected_attn_layer;
+            group = GGML_CPU_VISION_GROUP_FFN;
+            layer = marker_layer;
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "layer_out-", &marker_layer)) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_FFN || marker_layer != expected_ffn_layer;
+            ++expected_ffn_layer;
+            if (expected_ffn_layer < n_ffn_markers) {
+                group = GGML_CPU_VISION_GROUP_ATTENTION;
+                layer = expected_ffn_layer;
+            } else {
+                group = GGML_CPU_VISION_GROUP_MAIN_MERGER;
+                layer = -1;
+            }
+        } else if (strcmp(name, "vision_group_main_merger_out") == 0) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_MAIN_MERGER;
+            group = GGML_CPU_VISION_GROUP_DEEPSTACK;
+            layer = ggml_cpu_vision_next_deepstack_layer(cgraph, node_n + 1);
+        } else if (ggml_cpu_vision_parse_layer_marker(name, "vision_group_deepstack_out-", &marker_layer)) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_DEEPSTACK || marker_layer != layer;
+            layer = ggml_cpu_vision_next_deepstack_layer(cgraph, node_n + 1);
+        } else if (strcmp(name, "vision_group_output") == 0) {
+            marker_error |= group != GGML_CPU_VISION_GROUP_DEEPSTACK;
+            group = GGML_CPU_VISION_GROUP_OTHER;
+            layer = -1;
+        }
+    }
+
+    marker_error |= expected_attn_layer != n_attn_markers || expected_ffn_layer != n_ffn_markers;
+    marker_error |= executable_nodes != mapped_nodes;
+    for (int node_n = 0; node_n + 1 < cgraph->n_nodes; ++node_n) {
+        if (cgraph->nodes[node_n]->op == GGML_OP_RMS_NORM && cgraph->nodes[node_n + 1]->op == GGML_OP_MUL) {
+            const int a = tp->vision_timing_node_segments[node_n];
+            const int b = tp->vision_timing_node_segments[node_n + 1];
+            marker_error |= a >= 0 && b >= 0 && a != b;
+        }
+    }
+
+    tp->vision_timing_n_threads = n_threads;
+    tp->vision_timing_mapping_valid = !marker_error;
+    tp->vision_timing_active = !marker_error;
+
+    fprintf(stderr, "VISION_GROUP_TIMING event=GRAPH schema_version=1 valid=%d execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " nodes=%d executable_nodes=%d mapped_nodes=%d segments=%d layers=%d deepstack_markers=%d workers=%d clock_domain=monotonic_raw reason=%s\n",
+        (int) !marker_error, execution_id, phase_span_id, cgraph->n_nodes,
+        executable_nodes, mapped_nodes, tp->vision_timing_n_segments,
+        n_attn_markers, n_deepstack_markers, n_threads,
+        marker_error ? "MARKER_ORDER_OR_FUSION_BOUNDARY" : "OK");
+    return !marker_error;
 }
 
 static const char * ggml_cpu_attn_timing_path_name(enum ggml_cpu_attn_kernel_path path) {
@@ -3252,6 +3555,106 @@ static void ggml_cpu_attn_timing_emit(const struct ggml_threadpool * tp) {
     }
 }
 
+static void ggml_cpu_vision_group_timing_emit(const struct ggml_threadpool * tp) {
+    const int n_threads = tp->vision_timing_n_threads;
+    uint64_t group_elapsed[GGML_CPU_VISION_GROUP_COUNT] = { 0 };
+    uint64_t group_start[GGML_CPU_VISION_GROUP_COUNT];
+    uint64_t group_end[GGML_CPU_VISION_GROUP_COUNT] = { 0 };
+    int group_segments[GGML_CPU_VISION_GROUP_COUNT] = { 0 };
+    bool group_valid[GGML_CPU_VISION_GROUP_COUNT];
+    uint64_t measured_sum_ns = 0;
+    uint64_t graph_start_ns = UINT64_MAX;
+    uint64_t graph_end_ns = 0;
+    bool execution_valid = tp->vision_timing_mapping_valid;
+
+    for (int group = 0; group < GGML_CPU_VISION_GROUP_COUNT; ++group) {
+        group_start[group] = UINT64_MAX;
+        group_valid[group] = true;
+    }
+
+    flockfile(stderr);
+    for (int segment_n = 0; segment_n < tp->vision_timing_n_segments; ++segment_n) {
+        const struct ggml_cpu_vision_timing_segment * segment = &tp->vision_timing_segments[segment_n];
+        uint64_t start_ns = UINT64_MAX;
+        uint64_t compute_end_ns = 0;
+        int valid_workers = 0;
+
+        for (int ith = 0; ith < n_threads; ++ith) {
+            const struct ggml_cpu_vision_timing_worker * worker =
+                &tp->vision_timing_workers[(size_t) segment_n * n_threads + ith];
+            const bool worker_valid = worker->started && worker->completed &&
+                worker->start_ns != 0 && worker->end_ns >= worker->start_ns;
+            if (worker_valid) {
+                start_ns = MIN(start_ns, worker->start_ns);
+                compute_end_ns = MAX(compute_end_ns, worker->end_ns);
+                ++valid_workers;
+            }
+        }
+
+        uint64_t end_ns = compute_end_ns;
+        bool boundary_valid = true;
+        const char * end_boundary = "segment_compute_end";
+        if (segment_n + 1 < tp->vision_timing_n_segments) {
+            uint64_t next_start_ns = UINT64_MAX;
+            int next_started_workers = 0;
+            for (int ith = 0; ith < n_threads; ++ith) {
+                const struct ggml_cpu_vision_timing_worker * next_worker =
+                    &tp->vision_timing_workers[(size_t) (segment_n + 1) * n_threads + ith];
+                if (next_worker->started && next_worker->start_ns != 0) {
+                    next_start_ns = MIN(next_start_ns, next_worker->start_ns);
+                    ++next_started_workers;
+                }
+            }
+            boundary_valid = next_started_workers == n_threads && next_start_ns != UINT64_MAX &&
+                next_start_ns >= compute_end_ns;
+            if (boundary_valid) {
+                // Assign the existing inter-node barrier and dispatch gap to the
+                // preceding segment. Adjacent segment intervals therefore do not overlap.
+                end_ns = next_start_ns;
+            }
+            end_boundary = "next_segment_start";
+        }
+
+        const bool valid = valid_workers == n_threads && start_ns != UINT64_MAX &&
+            compute_end_ns >= start_ns && boundary_valid && end_ns >= start_ns;
+        const uint64_t output_start_ns = start_ns == UINT64_MAX ? 0 : start_ns;
+        const uint64_t elapsed_ns = valid ? end_ns - start_ns : 0;
+        const int group = segment->group;
+        group_segments[group]++;
+        group_valid[group] &= valid;
+        execution_valid &= valid;
+        if (valid) {
+            group_elapsed[group] += elapsed_ns;
+            group_start[group] = MIN(group_start[group], start_ns);
+            group_end[group] = MAX(group_end[group], end_ns);
+            measured_sum_ns += elapsed_ns;
+            graph_start_ns = MIN(graph_start_ns, start_ns);
+            graph_end_ns = MAX(graph_end_ns, end_ns);
+        }
+
+        fprintf(stderr, "VISION_GROUP_TIMING event=SEGMENT schema_version=1 valid=%d execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " segment=%d group=%s layer=%d node_start=%d node_end=%d start_ns=%" PRIu64 " compute_end_ns=%" PRIu64 " end_ns=%" PRIu64 " elapsed_ns=%" PRIu64 " workers=%d valid_workers=%d missing_workers=%d clock_domain=monotonic_raw end_boundary=%s\n",
+            (int) valid, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+            segment_n, ggml_cpu_vision_group_name(segment->group), segment->layer,
+            segment->node_start, segment->node_end, output_start_ns, compute_end_ns, end_ns, elapsed_ns,
+            n_threads, valid_workers, n_threads - valid_workers, end_boundary);
+    }
+
+    for (int group = 0; group < GGML_CPU_VISION_GROUP_COUNT; ++group) {
+        const bool valid = group_segments[group] == 0 || group_valid[group];
+        fprintf(stderr, "VISION_GROUP_TIMING event=GROUP schema_version=1 valid=%d execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " group=%s layer=-1 segment_count=%d start_ns=%" PRIu64 " end_ns=%" PRIu64 " elapsed_ns=%" PRIu64 " aggregation=sum_segments workers=%d clock_domain=monotonic_raw\n",
+            (int) valid, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+            ggml_cpu_vision_group_name((enum ggml_cpu_vision_group) group), group_segments[group],
+            group_start[group] == UINT64_MAX ? 0 : group_start[group], group_end[group],
+            valid ? group_elapsed[group] : 0, n_threads);
+    }
+
+    fprintf(stderr, "VISION_GROUP_TIMING event=EXECUTION schema_version=1 valid=%d execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " segment_count=%d start_ns=%" PRIu64 " end_ns=%" PRIu64 " measured_sum_ns=%" PRIu64 " residual_source=VISION_COMPUTE_PHASE_MINUS_MEASURED_SUM workers=%d clock_domain=monotonic_raw\n",
+        (int) execution_valid, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+        tp->vision_timing_n_segments, graph_start_ns == UINT64_MAX ? 0 : graph_start_ns,
+        graph_end_ns, execution_valid ? measured_sum_ns : 0, n_threads);
+    funlockfile(stderr);
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3293,6 +3696,20 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             continue;
         }
 
+        int vision_segment = -1;
+        struct ggml_cpu_vision_timing_worker * vision_worker = NULL;
+        if (tp->vision_timing_active) {
+            vision_segment = tp->vision_timing_node_segments[node_n];
+            if (vision_segment >= 0) {
+                const struct ggml_cpu_vision_timing_segment * segment = &tp->vision_timing_segments[vision_segment];
+                vision_worker = &tp->vision_timing_workers[(size_t) vision_segment * params.nth + state->ith];
+                if (node_n == segment->node_start) {
+                    vision_worker->started = true;
+                    vision_worker->start_ns = ggml_cpu_attn_timing_now_ns();
+                }
+            }
+        }
+
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
@@ -3319,6 +3736,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             tp->ec    = GGML_STATUS_ABORTED;
         }
 
+        if (vision_worker && node_n >= tp->vision_timing_segments[vision_segment].node_end) {
+            vision_worker->end_ns = ggml_cpu_attn_timing_now_ns();
+            vision_worker->completed = true;
+        }
+
         if (node_n + 1 < cgraph->n_nodes) {
             ggml_barrier(state->threadpool);
         }
@@ -3334,6 +3756,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
     if (state->ith == 0 && tp->attn_timing_active) {
         ggml_cpu_attn_timing_emit(tp);
+    }
+    if (state->ith == 0 && tp->vision_timing_active) {
+        ggml_cpu_vision_group_timing_emit(tp);
     }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
@@ -3509,6 +3934,17 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->attn_timing_n_nodes = 0;
         threadpool->attn_timing_n_threads = 0;
         threadpool->attn_timing_active = false;
+        threadpool->vision_timing_workers = NULL;
+        threadpool->vision_timing_segments = NULL;
+        threadpool->vision_timing_node_segments = NULL;
+        threadpool->vision_timing_worker_capacity = 0;
+        threadpool->vision_timing_node_capacity = 0;
+        threadpool->vision_timing_n_segments = 0;
+        threadpool->vision_timing_n_threads = 0;
+        threadpool->vision_timing_execution_id = 0;
+        threadpool->vision_timing_phase_span_id = 0;
+        threadpool->vision_timing_active = false;
+        threadpool->vision_timing_mapping_valid = false;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -3601,6 +4037,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
     ggml_cpu_attn_timing_prepare(threadpool, cgraph, n_threads);
+    ggml_cpu_vision_group_timing_prepare(threadpool, cgraph, n_threads);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -3611,6 +4048,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 // update the number of threads from the actual number of threads that we got from OpenMP
                 n_threads = omp_get_num_threads();
                 threadpool->attn_timing_n_threads = n_threads;
+                threadpool->vision_timing_n_threads = n_threads;
                 atomic_store_explicit(&threadpool->n_graph, n_threads, memory_order_relaxed);
             }
 
@@ -4119,6 +4557,11 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("LLAMA_CPU_ATTN_TIMING_RAW");
             ggml_cpu_attn_timing_raw = ggml_cpu_attn_timing && env != NULL && env[0] == '1' && env[1] == '\0';
+        }
+
+        {
+            const char * env = getenv("LLAMA_VISION_GROUP_TIMING");
+            ggml_cpu_vision_group_timing = env != NULL && env[0] == '1' && env[1] == '\0';
         }
 
         is_first_call = false;

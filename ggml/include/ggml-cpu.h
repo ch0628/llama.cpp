@@ -44,6 +44,7 @@ extern "C" {
     GGML_BACKEND_API int  ggml_cpu_attn_diag_bind_graph(const struct ggml_cgraph * graph, struct ggml_cpu_attn_diag_link link);
     GGML_BACKEND_API void ggml_cpu_attn_diag_clear_generation(uint64_t graph_generation);
     GGML_BACKEND_API int  ggml_cpu_attn_diag_get_link(const struct ggml_tensor * node, struct ggml_cpu_attn_diag_link * link);
+    GGML_BACKEND_API void ggml_cpu_vision_group_timing_set_context(uint64_t phase_span_id, bool active);
 
     // the compute plan that needs to be prepared for ggml_graph_compute()
     // since https://github.com/ggml-org/ggml/issues/287

@@ -60,6 +60,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
     // pre-layernorm
     if (model.pre_ln_w) {
         inpL = build_norm(inpL, model.pre_ln_w, model.pre_ln_b, norm_t, eps, -1);
+        cb(inpL, "vision_group_pre_ln", -1);
     }
 
     // deepstack features (stack along the feature dimension), [n_embd * len(deepstack_layers), n_patches_x * n_patches_y, batch_size]
@@ -155,6 +156,7 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
                 // concat along the feature dimension
                 deepstack_features = ggml_concat(ctx0, deepstack_features, feat, 0);
             }
+            cb(deepstack_features, "vision_group_deepstack_out", il);
         }
 
         inpL = cur;
@@ -174,9 +176,11 @@ ggml_cgraph * clip_graph_qwen3vl::build() {
         nullptr, nullptr,
         model.mm_1_w, model.mm_1_b,
         ffn_op_type::FFN_GELU, -1);
+    cb(embeddings, "vision_group_main_merger_out", -1);
 
     if (deepstack_features) {
         embeddings = ggml_concat(ctx0, embeddings, deepstack_features, 0);
+        cb(embeddings, "vision_group_output", -1);
     } // concat along the feature dimension
 
     // build the graph
