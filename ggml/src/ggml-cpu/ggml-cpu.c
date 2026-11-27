@@ -510,6 +510,24 @@ struct ggml_cpu_vision_timing_segment {
     int node_end;
 };
 
+enum ggml_cpu_vision_op_category {
+    GGML_CPU_VISION_OP_NONE = 0,
+    GGML_CPU_VISION_OP_FC1,
+    GGML_CPU_VISION_OP_GELU,
+    GGML_CPU_VISION_OP_FC2,
+    GGML_CPU_VISION_OP_QKV,
+    GGML_CPU_VISION_OP_ROPE_Q,
+    GGML_CPU_VISION_OP_ROPE_K,
+    GGML_CPU_VISION_OP_OUTPUT_PROJ,
+    GGML_CPU_VISION_OP_COUNT,
+};
+
+struct ggml_cpu_vision_op_worker {
+    uint64_t start_ns;
+    uint64_t end_ns;
+    uint64_t next_start_ns;
+};
+
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
     ggml_cond_t  cond;        // cond.var for waiting for new work
@@ -552,6 +570,12 @@ struct ggml_threadpool {
     uint64_t vision_timing_phase_span_id;
     bool vision_timing_active;
     bool vision_timing_mapping_valid;
+
+    struct ggml_cpu_vision_op_worker * vision_op_workers;
+    enum ggml_cpu_vision_op_category * vision_op_categories;
+    size_t vision_op_worker_capacity;
+    size_t vision_op_node_capacity;
+    bool vision_op_active;
 
     enum ggml_status ec;
 };
@@ -2821,6 +2845,8 @@ void ggml_threadpool_free(struct ggml_threadpool* threadpool) {
     free(threadpool->vision_timing_workers);
     free(threadpool->vision_timing_segments);
     free(threadpool->vision_timing_node_segments);
+    free(threadpool->vision_op_workers);
+    free(threadpool->vision_op_categories);
     ggml_aligned_free(threadpool, sizeof(struct ggml_threadpool));
 }
 
@@ -3125,6 +3151,8 @@ static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_in
 static bool ggml_cpu_attn_timing = false;     // initialized once in ggml_cpu_init(), read-only afterwards
 static bool ggml_cpu_attn_timing_raw = false; // initialized once in ggml_cpu_init(), read-only afterwards
 static bool ggml_cpu_vision_group_timing = false; // initialized once in ggml_cpu_init(), read-only afterwards
+static bool ggml_cpu_vision_op_timing = false;    // requires vision group timing
+static bool ggml_cpu_vision_op_timing_raw = false;
 static atomic_uint_fast64_t ggml_cpu_vision_group_next_execution_id = 0;
 static atomic_uint_fast64_t ggml_cpu_vision_group_phase_span_id = 0;
 static atomic_bool ggml_cpu_vision_group_context_active = false;
@@ -3435,6 +3463,240 @@ static bool ggml_cpu_vision_group_timing_prepare(struct ggml_threadpool * tp, co
     return !marker_error;
 }
 
+static const char * ggml_cpu_vision_op_name(enum ggml_cpu_vision_op_category category) {
+    static const char * names[] = { "NONE", "FC1", "GELU", "FC2", "QKV", "ROPE_Q", "ROPE_K", "OUTPUT_PROJ" };
+    return category > GGML_CPU_VISION_OP_NONE && category < GGML_CPU_VISION_OP_COUNT ? names[category] : "UNKNOWN";
+}
+
+static bool ggml_cpu_vision_op_weight_is(const struct ggml_tensor * node, int layer, const char * role) {
+    if (!node->src[0]) {
+        return false;
+    }
+    char suffix[64];
+    const int len = snprintf(suffix, sizeof(suffix), ".blk.%d.%s.weight", layer, role);
+    const char * name = node->src[0]->name;
+    const size_t name_len = strlen(name);
+    return len > 0 && (size_t) len < sizeof(suffix) && name_len >= (size_t) len &&
+        strcmp(name + name_len - (size_t) len, suffix) == 0;
+}
+
+static bool ggml_cpu_vision_op_shape_is(const struct ggml_tensor * node, int64_t width, int64_t tokens) {
+    return node->type == GGML_TYPE_F32 && node->ne[0] == width && node->ne[1] == tokens &&
+        node->ne[2] == 1 && node->ne[3] == 1;
+}
+
+static void ggml_cpu_vision_op_timing_prepare(struct ggml_threadpool * tp, const struct ggml_cgraph * cgraph, int n_threads) {
+    tp->vision_op_active = false;
+    if (!ggml_cpu_vision_op_timing || tp->vision_timing_execution_id == 0) {
+        return;
+    }
+
+    const char * reason = "OK";
+    if (!tp->vision_timing_mapping_valid || !tp->vision_timing_active) {
+        reason = "GROUP_MAPPING_INVALID";
+        goto invalid;
+    }
+
+    const size_t n_nodes = (size_t) cgraph->n_nodes;
+    const size_t n_workers = n_nodes * (size_t) n_threads;
+    if (n_nodes == 0 || n_threads <= 0 || n_workers / n_nodes != (size_t) n_threads ||
+            n_workers > SIZE_MAX / sizeof(struct ggml_cpu_vision_op_worker) ||
+            n_nodes > SIZE_MAX / sizeof(enum ggml_cpu_vision_op_category)) {
+        reason = "SIZE_OVERFLOW";
+        goto invalid;
+    }
+
+    struct ggml_cpu_vision_op_worker * new_workers = NULL;
+    enum ggml_cpu_vision_op_category * new_categories = NULL;
+    if (n_workers > tp->vision_op_worker_capacity) {
+        new_workers = malloc(n_workers * sizeof(*new_workers));
+    }
+    if (n_nodes > tp->vision_op_node_capacity) {
+        new_categories = malloc(n_nodes * sizeof(*new_categories));
+    }
+    if ((n_workers > tp->vision_op_worker_capacity && !new_workers) ||
+            (n_nodes > tp->vision_op_node_capacity && !new_categories)) {
+        free(new_workers);
+        free(new_categories);
+        reason = "ALLOC_FAILED";
+        goto invalid;
+    }
+    if (new_workers) {
+        free(tp->vision_op_workers);
+        tp->vision_op_workers = new_workers;
+        tp->vision_op_worker_capacity = n_workers;
+    }
+    if (new_categories) {
+        free(tp->vision_op_categories);
+        tp->vision_op_categories = new_categories;
+        tp->vision_op_node_capacity = n_nodes;
+    }
+    memset(tp->vision_op_workers, 0, n_workers * sizeof(*tp->vision_op_workers));
+    memset(tp->vision_op_categories, 0, n_nodes * sizeof(*tp->vision_op_categories));
+
+    // This diagnostic describes the validated 24-layer Qwen3-VL vision graph.
+    // Every category must occur exactly once in its parent segment and layer.
+    int indices[24][GGML_CPU_VISION_OP_COUNT];
+    int flash[24];
+    int attention_segments[24];
+    int ffn_segments[24];
+    for (int layer = 0; layer < 24; ++layer) {
+        for (int category = 0; category < GGML_CPU_VISION_OP_COUNT; ++category) {
+            indices[layer][category] = -1;
+        }
+        flash[layer] = -1;
+        attention_segments[layer] = -1;
+        ffn_segments[layer] = -1;
+    }
+
+    for (int segment_n = 0; segment_n < tp->vision_timing_n_segments; ++segment_n) {
+        const struct ggml_cpu_vision_timing_segment * segment = &tp->vision_timing_segments[segment_n];
+        if (segment->group != GGML_CPU_VISION_GROUP_ATTENTION && segment->group != GGML_CPU_VISION_GROUP_FFN) {
+            continue;
+        }
+        if (segment->layer < 0 || segment->layer >= 24) {
+            reason = "LAYER_COUNT_OR_ORDER";
+            goto invalid;
+        }
+        int * layer_segment = segment->group == GGML_CPU_VISION_GROUP_ATTENTION ?
+            &attention_segments[segment->layer] : &ffn_segments[segment->layer];
+        if (*layer_segment >= 0) {
+            reason = "DUPLICATE_SEGMENT";
+            goto invalid;
+        }
+        *layer_segment = segment_n;
+        for (int node_n = segment->node_start; node_n <= segment->node_end; ++node_n) {
+            const struct ggml_tensor * node = cgraph->nodes[node_n];
+            if (!ggml_cpu_vision_node_is_executable(node)) {
+                continue;
+            }
+            if (tp->vision_timing_node_segments[node_n] != segment_n) {
+                reason = "PARENT_SEGMENT_MISMATCH";
+                goto invalid;
+            }
+            enum ggml_cpu_vision_op_category category = GGML_CPU_VISION_OP_NONE;
+            int marker_layer = -1;
+            if (node->op == GGML_OP_MUL_MAT) {
+                if (segment->group == GGML_CPU_VISION_GROUP_FFN) {
+                    if (ggml_cpu_vision_parse_layer_marker(node->name, "ffn_up-", &marker_layer) &&
+                            ggml_cpu_vision_op_weight_is(node, segment->layer, "ffn_up")) {
+                        category = GGML_CPU_VISION_OP_FC1;
+                    } else if (ggml_cpu_vision_parse_layer_marker(node->name, "ffn_down-", &marker_layer) &&
+                            ggml_cpu_vision_op_weight_is(node, segment->layer, "ffn_down")) {
+                        category = GGML_CPU_VISION_OP_FC2;
+                    }
+                } else if (ggml_cpu_vision_op_weight_is(node, segment->layer, "attn_qkv")) {
+                    category = GGML_CPU_VISION_OP_QKV;
+                    marker_layer = segment->layer;
+                } else if (ggml_cpu_vision_op_weight_is(node, segment->layer, "attn_out")) {
+                    category = GGML_CPU_VISION_OP_OUTPUT_PROJ;
+                    marker_layer = segment->layer;
+                }
+                if (category == GGML_CPU_VISION_OP_NONE) {
+                    reason = "UNEXPECTED_MUL_MAT";
+                    goto invalid;
+                }
+            } else if (node->op == GGML_OP_ROPE) {
+                if (segment->group == GGML_CPU_VISION_GROUP_ATTENTION &&
+                        ggml_cpu_vision_parse_layer_marker(node->name, "Qcur_rope-", &marker_layer)) {
+                    category = GGML_CPU_VISION_OP_ROPE_Q;
+                } else if (segment->group == GGML_CPU_VISION_GROUP_ATTENTION &&
+                        ggml_cpu_vision_parse_layer_marker(node->name, "Kcur_rope-", &marker_layer)) {
+                    category = GGML_CPU_VISION_OP_ROPE_K;
+                } else {
+                    reason = "UNEXPECTED_ROPE";
+                    goto invalid;
+                }
+            } else if (node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_GELU) {
+                if (segment->group != GGML_CPU_VISION_GROUP_FFN ||
+                        !ggml_cpu_vision_parse_layer_marker(node->name, "ffn_gelu-", &marker_layer)) {
+                    reason = "UNEXPECTED_GELU";
+                    goto invalid;
+                }
+                category = GGML_CPU_VISION_OP_GELU;
+            } else if (node->op == GGML_OP_FLASH_ATTN_EXT && segment->group == GGML_CPU_VISION_GROUP_ATTENTION) {
+                if (flash[segment->layer] >= 0) {
+                    reason = "DUPLICATE_FLASH";
+                    goto invalid;
+                }
+                flash[segment->layer] = node_n;
+            }
+            if (category != GGML_CPU_VISION_OP_NONE) {
+                if (marker_layer != segment->layer || indices[segment->layer][category] >= 0) {
+                    reason = "OP_LAYER_OR_DUPLICATE";
+                    goto invalid;
+                }
+                indices[segment->layer][category] = node_n;
+                tp->vision_op_categories[node_n] = category;
+            }
+        }
+    }
+
+    for (int layer = 0; layer < 24; ++layer) {
+        if (attention_segments[layer] < 0 || ffn_segments[layer] < 0 || flash[layer] < 0) {
+            reason = "MISSING_SEGMENT_OR_FLASH";
+            goto invalid;
+        }
+        for (int category = GGML_CPU_VISION_OP_FC1; category < GGML_CPU_VISION_OP_COUNT; ++category) {
+            if (indices[layer][category] < 0) {
+                reason = "MISSING_OPERATOR";
+                goto invalid;
+            }
+        }
+        const int fc1 = indices[layer][GGML_CPU_VISION_OP_FC1];
+        const int gelu = indices[layer][GGML_CPU_VISION_OP_GELU];
+        const int fc2 = indices[layer][GGML_CPU_VISION_OP_FC2];
+        const int qkv = indices[layer][GGML_CPU_VISION_OP_QKV];
+        const int rope_q = indices[layer][GGML_CPU_VISION_OP_ROPE_Q];
+        const int rope_k = indices[layer][GGML_CPU_VISION_OP_ROPE_K];
+        const int proj = indices[layer][GGML_CPU_VISION_OP_OUTPUT_PROJ];
+        if (!(qkv < rope_q && rope_q < rope_k && rope_k < flash[layer] && flash[layer] < proj &&
+                proj < fc1 && fc1 < gelu && gelu < fc2)) {
+            reason = "OP_ORDER";
+            goto invalid;
+        }
+        const struct ggml_tensor * qkv_node = cgraph->nodes[qkv];
+        const struct ggml_tensor * proj_node = cgraph->nodes[proj];
+        const struct ggml_tensor * fc1_node = cgraph->nodes[fc1];
+        const struct ggml_tensor * gelu_node = cgraph->nodes[gelu];
+        const struct ggml_tensor * fc2_node = cgraph->nodes[fc2];
+        const int64_t hidden = proj_node->ne[0];
+        const int64_t tokens = proj_node->ne[1];
+        if (hidden <= 0 || tokens <= 0 || hidden > INT64_MAX / 4 ||
+                !ggml_cpu_vision_op_shape_is(qkv_node, 3 * hidden, tokens) ||
+                !ggml_cpu_vision_op_shape_is(proj_node, hidden, tokens) ||
+                !ggml_cpu_vision_op_shape_is(fc1_node, 4 * hidden, tokens) ||
+                !ggml_cpu_vision_op_shape_is(gelu_node, 4 * hidden, tokens) ||
+                !ggml_cpu_vision_op_shape_is(fc2_node, hidden, tokens) ||
+                fc2_node->src[1] != gelu_node ||
+                qkv_node->src[0]->ne[0] != hidden || qkv_node->src[0]->ne[1] != 3 * hidden ||
+                proj_node->src[0]->ne[0] != hidden || proj_node->src[0]->ne[1] != hidden ||
+                fc1_node->src[0]->ne[0] != hidden || fc1_node->src[0]->ne[1] != 4 * hidden ||
+                fc2_node->src[0]->ne[0] != 4 * hidden || fc2_node->src[0]->ne[1] != hidden) {
+            reason = "OP_SHAPE_OR_LINK";
+            goto invalid;
+        }
+        for (int category = GGML_CPU_VISION_OP_ROPE_Q; category <= GGML_CPU_VISION_OP_ROPE_K; ++category) {
+            const struct ggml_tensor * rope = cgraph->nodes[indices[layer][category]];
+            if (rope->type != GGML_TYPE_F32 || rope->ne[0] <= 0 || rope->ne[1] <= 0 ||
+                    rope->ne[0] > INT64_MAX / rope->ne[1] || rope->ne[0] * rope->ne[1] != hidden ||
+                    rope->ne[2] != tokens || rope->ne[3] != 1) {
+                reason = "ROPE_SHAPE";
+                goto invalid;
+            }
+        }
+    }
+
+    tp->vision_op_active = true;
+    fprintf(stderr, "VISION_OP_TIMING event=GRAPH schema_version=1 valid=1 reason=OK vision_execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " operators=168 layers=24 workers=%d clock_domain=monotonic_raw\n",
+        tp->vision_timing_execution_id, tp->vision_timing_phase_span_id, n_threads);
+    return;
+
+invalid:
+    fprintf(stderr, "VISION_OP_TIMING event=GRAPH schema_version=1 valid=0 reason=%s vision_execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " operators=0 layers=0 workers=%d clock_domain=monotonic_raw\n",
+        reason, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id, n_threads);
+}
+
 static const char * ggml_cpu_attn_timing_path_name(enum ggml_cpu_attn_kernel_path path) {
     switch (path) {
         case GGML_CPU_ATTN_KERNEL_ONE_CHUNK: return "ONE_CHUNK";
@@ -3655,6 +3917,123 @@ static void ggml_cpu_vision_group_timing_emit(const struct ggml_threadpool * tp)
     funlockfile(stderr);
 }
 
+static void ggml_cpu_vision_op_timing_emit(const struct ggml_threadpool * tp) {
+    const struct ggml_cgraph * cgraph = tp->cgraph;
+    const int n_threads = tp->vision_timing_n_threads;
+    int valid_ops = 0;
+    int invalid_ops = 0;
+
+    flockfile(stderr);
+    for (int node_n = 0; node_n < cgraph->n_nodes; ++node_n) {
+        const enum ggml_cpu_vision_op_category category = tp->vision_op_categories[node_n];
+        if (category == GGML_CPU_VISION_OP_NONE) {
+            continue;
+        }
+        const struct ggml_tensor * node = cgraph->nodes[node_n];
+        const int parent_segment = tp->vision_timing_node_segments[node_n];
+        const struct ggml_cpu_vision_timing_segment * segment = &tp->vision_timing_segments[parent_segment];
+        uint64_t start_ns = UINT64_MAX;
+        uint64_t compute_end_ns = 0;
+        uint64_t next_start_ns = UINT64_MAX;
+        uint64_t parent_start_ns = UINT64_MAX;
+        uint64_t parent_end_ns = 0;
+        int valid_workers = 0;
+        int valid_next_workers = 0;
+        int valid_parent_workers = 0;
+
+        for (int ith = 0; ith < n_threads; ++ith) {
+            const struct ggml_cpu_vision_op_worker * worker =
+                &tp->vision_op_workers[(size_t) node_n * n_threads + ith];
+            const bool worker_valid = worker->start_ns != 0 && worker->end_ns >= worker->start_ns;
+            if (worker_valid) {
+                start_ns = MIN(start_ns, worker->start_ns);
+                compute_end_ns = MAX(compute_end_ns, worker->end_ns);
+                ++valid_workers;
+            }
+            if (worker->next_start_ns != 0) {
+                next_start_ns = MIN(next_start_ns, worker->next_start_ns);
+                ++valid_next_workers;
+            }
+            const struct ggml_cpu_vision_timing_worker * parent_worker =
+                &tp->vision_timing_workers[(size_t) parent_segment * n_threads + ith];
+            if (parent_worker->started && parent_worker->completed && parent_worker->start_ns != 0 &&
+                    parent_worker->end_ns >= parent_worker->start_ns) {
+                parent_start_ns = MIN(parent_start_ns, parent_worker->start_ns);
+                parent_end_ns = MAX(parent_end_ns, parent_worker->end_ns);
+                ++valid_parent_workers;
+            }
+        }
+
+        // Group segments assign the gap before the next segment to the current
+        // segment. Use the same boundary when checking operator containment.
+        if (parent_segment + 1 < tp->vision_timing_n_segments) {
+            uint64_t next_segment_start_ns = UINT64_MAX;
+            int next_segment_workers = 0;
+            for (int ith = 0; ith < n_threads; ++ith) {
+                const struct ggml_cpu_vision_timing_worker * next_worker =
+                    &tp->vision_timing_workers[(size_t) (parent_segment + 1) * n_threads + ith];
+                if (next_worker->started && next_worker->start_ns != 0) {
+                    next_segment_start_ns = MIN(next_segment_start_ns, next_worker->start_ns);
+                    ++next_segment_workers;
+                }
+            }
+            if (next_segment_workers == n_threads && next_segment_start_ns >= parent_end_ns) {
+                parent_end_ns = next_segment_start_ns;
+            } else {
+                valid_parent_workers = 0;
+            }
+        }
+
+        const bool worker_valid = valid_workers == n_threads && start_ns != UINT64_MAX && compute_end_ns >= start_ns;
+        const bool interval_valid = valid_next_workers == n_threads && next_start_ns != UINT64_MAX &&
+            next_start_ns >= compute_end_ns;
+        const bool parent_valid = valid_parent_workers == n_threads && parent_start_ns != UINT64_MAX &&
+            parent_start_ns <= start_ns && compute_end_ns <= parent_end_ns &&
+            (!interval_valid || next_start_ns <= parent_end_ns);
+        const bool valid = worker_valid && interval_valid && parent_valid;
+        const char * reason = !worker_valid ? "WORKER_TIMING" : !interval_valid ? "NEXT_NODE_BOUNDARY" :
+            !parent_valid ? "PARENT_BOUNDARY" : "OK";
+        const uint64_t output_start_ns = start_ns == UINT64_MAX ? 0 : start_ns;
+        const uint64_t compute_elapsed_ns = worker_valid ? compute_end_ns - start_ns : 0;
+        const uint64_t interval_elapsed_ns = interval_valid ? next_start_ns - start_ns : 0;
+        const uint64_t barrier_dispatch_gap_ns = interval_valid ? next_start_ns - compute_end_ns : 0;
+        const struct ggml_tensor * weight = node->op == GGML_OP_MUL_MAT ? node->src[0] : NULL;
+
+        valid_ops += valid;
+        invalid_ops += !valid;
+        fprintf(stderr, "VISION_OP_TIMING event=OP schema_version=1 valid=%d reason=%s vision_execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " layer=%d group=%s category=%s node_index=%d ggml_op=%s unary_op=%s tensor_name=%s shape=%" PRId64 "x%" PRId64 "x%" PRId64 "x%" PRId64 " type=%s weight_name=%s weight_shape=%" PRId64 "x%" PRId64 " weight_type=%s start_ns=%" PRIu64 " end_ns=%" PRIu64 " compute_elapsed_ns=%" PRIu64 " interval_end_ns=%" PRIu64 " interval_elapsed_ns=%" PRIu64 " barrier_dispatch_gap_ns=%" PRIu64 " interval_boundary=next_executable_node_start parent_segment=%d parent_node_start=%d parent_node_end=%d parent_start_ns=%" PRIu64 " parent_end_ns=%" PRIu64 " workers=%d valid_workers=%d missing_workers=%d clock_domain=monotonic_raw\n",
+            (int) valid, reason, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+            segment->layer, ggml_cpu_vision_group_name(segment->group), ggml_cpu_vision_op_name(category),
+            node_n, ggml_op_name(node->op), node->op == GGML_OP_UNARY ? ggml_unary_op_name(ggml_get_unary_op(node)) : "NA",
+            node->name, node->ne[0], node->ne[1], node->ne[2], node->ne[3],
+            ggml_type_name(node->type), weight ? weight->name : "NA", weight ? weight->ne[0] : 0, weight ? weight->ne[1] : 0,
+            weight ? ggml_type_name(weight->type) : "NA", output_start_ns, compute_end_ns,
+            compute_elapsed_ns, interval_valid ? next_start_ns : 0, interval_elapsed_ns, barrier_dispatch_gap_ns,
+            parent_segment, segment->node_start, segment->node_end,
+            parent_start_ns == UINT64_MAX ? 0 : parent_start_ns, parent_end_ns,
+            n_threads, valid_workers, n_threads - valid_workers);
+
+        if (ggml_cpu_vision_op_timing_raw) {
+            for (int ith = 0; ith < n_threads; ++ith) {
+                const struct ggml_cpu_vision_op_worker * worker =
+                    &tp->vision_op_workers[(size_t) node_n * n_threads + ith];
+                const bool raw_valid = worker->start_ns != 0 && worker->end_ns >= worker->start_ns &&
+                    worker->next_start_ns >= worker->end_ns;
+                fprintf(stderr, "VISION_OP_TIMING event=WORKER schema_version=1 valid=%d vision_execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " parent_segment=%d layer=%d category=%s node_index=%d ith=%d start_ns=%" PRIu64 " end_ns=%" PRIu64 " next_start_ns=%" PRIu64 " clock_domain=monotonic_raw\n",
+                    (int) raw_valid, tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+                    parent_segment, segment->layer, ggml_cpu_vision_op_name(category), node_n, ith,
+                    worker->start_ns, worker->end_ns, worker->next_start_ns);
+            }
+        }
+    }
+    fprintf(stderr, "VISION_OP_TIMING event=EXECUTION schema_version=1 valid=%d reason=%s vision_execution_id=%" PRIu64 " phase_span_id=%" PRIu64 " operators=%d valid_operators=%d invalid_operators=%d layers=24 workers=%d clock_domain=monotonic_raw\n",
+        (int) (valid_ops == 168 && invalid_ops == 0),
+        valid_ops == 168 && invalid_ops == 0 ? "OK" : "OP_TIMING_INVALID",
+        tp->vision_timing_execution_id, tp->vision_timing_phase_span_id,
+        valid_ops + invalid_ops, valid_ops, invalid_ops, n_threads);
+    funlockfile(stderr);
+}
+
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
@@ -3684,6 +4063,7 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     GGML_PRINT_DEBUG("thread #%d compute-start cplan %p last-graph %d\n", state->ith, (const void *)cplan, state->last_graph);
 #endif
 
+    int previous_timed_node = -1;
     for (int node_n = 0; node_n < cgraph->n_nodes && atomic_load_explicit(&tp->abort, memory_order_relaxed) != node_n; node_n++) {
         struct ggml_tensor * node = cgraph->nodes[node_n];
 
@@ -3694,6 +4074,12 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (previous_timed_node >= 0) {
+            tp->vision_op_workers[(size_t) previous_timed_node * params.nth + state->ith].next_start_ns =
+                ggml_cpu_attn_timing_now_ns();
+            previous_timed_node = -1;
         }
 
         int vision_segment = -1;
@@ -3717,6 +4103,11 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
             node_n += n_fused;
         } else {
             struct ggml_cpu_attn_timing_worker * timing_worker = NULL;
+            struct ggml_cpu_vision_op_worker * op_worker = NULL;
+            if (tp->vision_op_active && tp->vision_op_categories[node_n] != GGML_CPU_VISION_OP_NONE) {
+                op_worker = &tp->vision_op_workers[(size_t) node_n * params.nth + state->ith];
+                op_worker->start_ns = ggml_cpu_attn_timing_now_ns();
+            }
             if (tp->attn_timing_active && node->op == GGML_OP_FLASH_ATTN_EXT) {
                 timing_worker = &tp->attn_timing_workers[(size_t) node_n * params.nth + state->ith];
                 timing_worker->attempted = true;
@@ -3724,6 +4115,10 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
                 timing_worker->start_ns = ggml_cpu_attn_timing_now_ns();
             }
             ggml_compute_forward(&params, node);
+            if (op_worker) {
+                op_worker->end_ns = ggml_cpu_attn_timing_now_ns();
+                previous_timed_node = node_n;
+            }
             if (timing_worker) {
                 timing_worker->end_ns = ggml_cpu_attn_timing_now_ns();
                 params.attn_timing_path = NULL;
@@ -3759,6 +4154,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
     }
     if (state->ith == 0 && tp->vision_timing_active) {
         ggml_cpu_vision_group_timing_emit(tp);
+    }
+    if (state->ith == 0 && tp->vision_op_active) {
+        ggml_cpu_vision_op_timing_emit(tp);
     }
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
@@ -3945,6 +4343,11 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
         threadpool->vision_timing_phase_span_id = 0;
         threadpool->vision_timing_active = false;
         threadpool->vision_timing_mapping_valid = false;
+        threadpool->vision_op_workers = NULL;
+        threadpool->vision_op_categories = NULL;
+        threadpool->vision_op_worker_capacity = 0;
+        threadpool->vision_op_node_capacity = 0;
+        threadpool->vision_op_active = false;
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
@@ -4038,6 +4441,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     ggml_cpu_attn_timing_prepare(threadpool, cgraph, n_threads);
     ggml_cpu_vision_group_timing_prepare(threadpool, cgraph, n_threads);
+    ggml_cpu_vision_op_timing_prepare(threadpool, cgraph, n_threads);
 
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
@@ -4562,6 +4966,16 @@ void ggml_cpu_init(void) {
         {
             const char * env = getenv("LLAMA_VISION_GROUP_TIMING");
             ggml_cpu_vision_group_timing = env != NULL && env[0] == '1' && env[1] == '\0';
+        }
+
+        {
+            const char * env = getenv("LLAMA_VISION_OP_TIMING");
+            ggml_cpu_vision_op_timing = ggml_cpu_vision_group_timing && env != NULL && env[0] == '1' && env[1] == '\0';
+        }
+
+        {
+            const char * env = getenv("LLAMA_VISION_OP_TIMING_RAW");
+            ggml_cpu_vision_op_timing_raw = ggml_cpu_vision_op_timing && env != NULL && env[0] == '1' && env[1] == '\0';
         }
 
         is_first_call = false;
