@@ -1287,6 +1287,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
+            const bool use_direct_output = type == GGML_TYPE_Q8_0 && num_rows_per_vec_dot == 1 && nb0 == sizeof(float) && ir0_end - iir0 >= blck_0;
+
             for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
                 const int64_t i13 = (ir1 / (ne12 * ne1));
                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
@@ -1316,12 +1318,18 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
                 //}
 
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
-                }
+                if (use_direct_output) {
+                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0; ++ir0) {
+                        vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0 * nb01, 0, src1_col, 0, 1);
+                    }
+                } else {
+                    for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    }
 
-                for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
+                        memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                    }
                 }
             }
         }
