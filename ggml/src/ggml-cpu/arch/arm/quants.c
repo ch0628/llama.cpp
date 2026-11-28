@@ -1147,12 +1147,49 @@ void ggml_vec_dot_q5_1_q8_1(int n, float * GGML_RESTRICT s, size_t bs, const voi
     *s = sumf;
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && !defined(__ARM_FEATURE_DOTPROD) && \
+    !defined(__ARM_FEATURE_MATMUL_INT8) && !defined(__ARM_FEATURE_SVE) && !defined(__ARM_FEATURE_SME)
+static inline float32x4x4_t ggml_vec_dot_q8_0_q8_0_2x2_block(
+        const block_q8_0 * x0, const block_q8_0 * x1,
+        const block_q8_0 * y0, const block_q8_0 * y1, float32x4x4_t sumv) {
+    const int8x16_t x0_l = vld1q_s8(x0->qs);
+    const int8x16_t x0_h = vld1q_s8(x0->qs + 16);
+    const int8x16_t x1_l = vld1q_s8(x1->qs);
+    const int8x16_t x1_h = vld1q_s8(x1->qs + 16);
+    const int8x16_t y0_l = vld1q_s8(y0->qs);
+    const int8x16_t y0_h = vld1q_s8(y0->qs + 16);
+    const int8x16_t y1_l = vld1q_s8(y1->qs);
+    const int8x16_t y1_h = vld1q_s8(y1->qs + 16);
+
+    const float dx0 = GGML_CPU_FP16_TO_FP32(x0->d);
+    const float dx1 = GGML_CPU_FP16_TO_FP32(x1->d);
+    const float dy0 = GGML_CPU_FP16_TO_FP32(y0->d);
+    const float dy1 = GGML_CPU_FP16_TO_FP32(y1->d);
+
+    sumv.val[0] = vmlaq_n_f32(sumv.val[0], vcvtq_f32_s32(vaddq_s32(
+            ggml_vdotq_s32(vdupq_n_s32(0), x0_l, y0_l),
+            ggml_vdotq_s32(vdupq_n_s32(0), x0_h, y0_h))), dx0*dy0);
+    sumv.val[1] = vmlaq_n_f32(sumv.val[1], vcvtq_f32_s32(vaddq_s32(
+            ggml_vdotq_s32(vdupq_n_s32(0), x1_l, y0_l),
+            ggml_vdotq_s32(vdupq_n_s32(0), x1_h, y0_h))), dx1*dy0);
+    sumv.val[2] = vmlaq_n_f32(sumv.val[2], vcvtq_f32_s32(vaddq_s32(
+            ggml_vdotq_s32(vdupq_n_s32(0), x0_l, y1_l),
+            ggml_vdotq_s32(vdupq_n_s32(0), x0_h, y1_h))), dx0*dy1);
+    sumv.val[3] = vmlaq_n_f32(sumv.val[3], vcvtq_f32_s32(vaddq_s32(
+            ggml_vdotq_s32(vdupq_n_s32(0), x1_l, y1_l),
+            ggml_vdotq_s32(vdupq_n_s32(0), x1_h, y1_h))), dx1*dy1);
+
+    return sumv;
+}
+#endif
+
 void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
     const int qk = QK8_0;
     const int nb = n / qk;
 
     assert(n % qk == 0);
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(__aarch64__) && defined(__ARM_NEON) && \
+    !defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_SVE) && !defined(__ARM_FEATURE_SME))
     assert((nrc == 2) || (nrc == 1));
 #else
     assert(nrc == 1);
@@ -1222,6 +1259,39 @@ void ggml_vec_dot_q8_0_q8_0(int n, float * GGML_RESTRICT s, size_t bs, const voi
         vst1_f32(s,      vget_low_f32 (sumv2));
         vst1_f32(s + bs, vget_high_f32(sumv2));
 
+        return;
+    }
+#elif defined(__aarch64__) && defined(__ARM_NEON) && !defined(__ARM_FEATURE_DOTPROD) && \
+      !defined(__ARM_FEATURE_SVE) && !defined(__ARM_FEATURE_SME)
+    if (nrc == 2) {
+        const block_q8_0 * vx0 = vx;
+        const block_q8_0 * vx1 = (const block_q8_0 *) ((const uint8_t *) vx + bx);
+        const block_q8_0 * vy0 = vy;
+        const block_q8_0 * vy1 = (const block_q8_0 *) ((const uint8_t *) vy + by);
+
+        // Keep odd block counts on the single-output path, including its scalar tail.
+        if (nb % 2 != 0) {
+            ggml_vec_dot_q8_0_q8_0(n, s,          0, vx0, 0, vy0, 0, 1);
+            ggml_vec_dot_q8_0_q8_0(n, s + 1,      0, vx1, 0, vy0, 0, 1);
+            ggml_vec_dot_q8_0_q8_0(n, s + bs,     0, vx0, 0, vy1, 0, 1);
+            ggml_vec_dot_q8_0_q8_0(n, s + bs + 1, 0, vx1, 0, vy1, 0, 1);
+            return;
+        }
+
+        float32x4x4_t sumv0 = {{vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f)}};
+        float32x4x4_t sumv1 = sumv0;
+
+        // Keep the same block parity and lane sums as four single-output calls.
+        for (int i = 0; i < nb; i += 2) {
+            sumv0 = ggml_vec_dot_q8_0_q8_0_2x2_block(&vx0[i],     &vx1[i],     &vy0[i],     &vy1[i],     sumv0);
+            sumv1 = ggml_vec_dot_q8_0_q8_0_2x2_block(&vx0[i + 1], &vx1[i + 1], &vy0[i + 1], &vy1[i + 1], sumv1);
+        }
+
+        // bs is in floats; bx and by are in bytes.
+        s[0]      = vaddvq_f32(sumv0.val[0]) + vaddvq_f32(sumv1.val[0]);
+        s[1]      = vaddvq_f32(sumv0.val[1]) + vaddvq_f32(sumv1.val[1]);
+        s[bs]     = vaddvq_f32(sumv0.val[2]) + vaddvq_f32(sumv1.val[2]);
+        s[bs + 1] = vaddvq_f32(sumv0.val[3]) + vaddvq_f32(sumv1.val[3]);
         return;
     }
 #endif

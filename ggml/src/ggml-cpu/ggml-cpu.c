@@ -274,7 +274,8 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_q8_0,
         .vec_dot                  = ggml_vec_dot_q8_0_q8_0,
         .vec_dot_type             = GGML_TYPE_Q8_0,
-#if defined (__ARM_FEATURE_MATMUL_INT8)
+#if defined(__ARM_FEATURE_MATMUL_INT8) || (defined(__aarch64__) && defined(__ARM_NEON) && \
+    !defined(__ARM_FEATURE_DOTPROD) && !defined(__ARM_FEATURE_SVE) && !defined(__ARM_FEATURE_SME))
         .nrows                    = 2,
 #else
         .nrows                    = 1,
@@ -1282,7 +1283,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
+    // 16 * 2, accounting for multi-output kernels
     float tmp[32];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
@@ -1519,7 +1520,7 @@ UseGgmlGemm2:;
         const int64_t ir1_start = dr1 * ith1;
         const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
 
-        // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
+        // Multi-output kernels can process 2 rows and cols at a time.
         int64_t num_rows_per_vec_dot = vec_dot_num_rows;
 
         // these checks are needed to avoid crossing dim1 boundaries
